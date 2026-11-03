@@ -38,6 +38,7 @@
 
   const DEFAULTS = {
     v: 2, rate: 1, pitch: 1, voiceURI: '', gap: 0, repeat: false,
+    engine: 'device', cloudKey: '', cloudVoice: 'en-US-Chirp3-HD-Aoede', cloudLimit: 900000,
     fontSize: 19, font: 'serif', theme: 'auto', wordHL: true, translate: false,
     skipHeaders: true, skipCites: true, wakeLock: true, view: 'text',
   };
@@ -47,17 +48,21 @@
   const settings = Object.assign({}, DEFAULTS, storedSettings, { v: DEFAULTS.v });
   const saveSettings = () => store.set('settings', settings);
 
-  // 開いたPDFの本体はIndexedDBに置く(metaは一覧用、blobsは中身)
+  // 開いたPDFの本体はIndexedDBに置く(metaは一覧用、blobsは中身、audioはクラウドの声で作った音声)
+  const AUDIO_CACHE_MAX = 4000; // 保存しておく音声の数(1文あたり20KB前後)
   const library = (() => {
     let dbp = null;
+    let puts = 0;
     function open() {
       if (!dbp) {
         dbp = new Promise((resolve, reject) => {
           try {
-            const req = indexedDB.open('pdfreader', 1);
+            const req = indexedDB.open('pdfreader', 2);
             req.onupgradeneeded = () => {
-              req.result.createObjectStore('meta', { keyPath: 'id' });
-              req.result.createObjectStore('blobs', { keyPath: 'id' });
+              const db = req.result;
+              if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'id' });
+              if (!db.objectStoreNames.contains('blobs')) db.createObjectStore('blobs', { keyPath: 'id' });
+              if (!db.objectStoreNames.contains('audio')) db.createObjectStore('audio', { keyPath: 'key' }).createIndex('t', 't');
             };
             req.onsuccess = () => resolve(req.result);
             req.onerror = () => reject(req.error);
@@ -98,6 +103,30 @@
         t.objectStore('meta').delete(id);
         t.objectStore('blobs').delete(id);
       }),
+      audioGet: (key) => run(['audio'], 'readonly', (t, box) => {
+        const r = t.objectStore('audio').get(key);
+        r.onsuccess = () => { box.value = r.result && r.result.blob; };
+      }),
+      audioPut(key, blob) {
+        const p = run(['audio'], 'readwrite', (t) => { t.objectStore('audio').put({ key, blob, t: Date.now() }); });
+        if (++puts % 50 === 0) p.then(() => this.audioPrune()).catch(() => {});
+        return p;
+      },
+      // 古い音声から消して、保存数を AUDIO_CACHE_MAX 以下に保つ
+      audioPrune: () => run(['audio'], 'readwrite', (t) => {
+        const store = t.objectStore('audio');
+        const c = store.count();
+        c.onsuccess = () => {
+          let extra = c.result - AUDIO_CACHE_MAX;
+          if (extra <= 0) return;
+          store.index('t').openCursor().onsuccess = (e) => {
+            const cur = e.target.result;
+            if (!cur || extra-- <= 0) return;
+            cur.delete();
+            cur.continue();
+          };
+        };
+      }),
     };
   })();
 
@@ -116,6 +145,7 @@
     userScrollAt: 0, seeking: false, seekAt: 0,
     pdfPage: 1, pdfFollow: true, zoom: 1, pdfScale: 1, renderTok: 0, renderTask: null,
     sleepAt: 0, sleepMin: 0, sleepTimer: 0, sleepTick: 0, sleepPending: false,
+    audioIdx: -1, cloudError: false, unlock: null,
   };
 
   // ---------------------------------------------------------------- text extraction
@@ -448,6 +478,7 @@
     applyView();
     if (saved && st.idx > 0) toast(`前回の続き(${doc.sentences[st.idx].page + 1}ページ)から再生できます`);
 
+    updateMediaMeta();
     const meta = { id, name, size, numPages: pdf.numPages, nSent: doc.sentences.length, opened: Date.now() };
     try {
       const old = await library.getMeta(id);
@@ -879,6 +910,9 @@
     if (doc && doc.maxChunk !== chunkLimit()) rebuild();
   }
   function updateVoiceLabel() {
+    const cloud = cloudActive();
+    $('#voiceChip').classList.toggle('cloud', cloud);
+    if (cloud) { $('#voiceLabel').textContent = cloudVoiceShort(settings.cloudVoice); return; }
     const v = currentVoice();
     $('#voiceLabel').textContent = v ? v.name.replace(/^(Microsoft|Google)\s+/, '').replace(/\s+Online.*$/, '') : '標準';
   }
@@ -927,12 +961,21 @@
 
   function play() {
     if (!doc || !doc.sentences.length) return;
-    if (!synth) { toast('このブラウザは音声読み上げに対応していません'); return; }
+    if (!synth && !cloudActive()) { toast('このブラウザは音声読み上げに対応していません'); return; }
     st.playing = true;
     st.errors = 0;
     st.retries = 0;
     updatePlayBtn();
     acquireWakeLock();
+    if (cloudActive()) {
+      unlockAudio(); // iOSではタップ操作の中で一度再生しておかないと、あとから音声を流せない
+      // 一時停止した文の音声が残っていれば、止めた位置からそのまま再開する
+      if (st.audioIdx === st.idx && audioEl.currentTime > 0 && !audioEl.ended) {
+        audioEl.playbackRate = settings.rate;
+        audioEl.play().catch(() => { pause(); });
+        return;
+      }
+    }
     speakFrom(st.idx, st.offset);
   }
 
@@ -942,6 +985,7 @@
     clearTimers();
     st.offset = st.wordPos;
     if (synth) synth.cancel();
+    if (!audioEl.paused) audioEl.pause();
     updatePlayBtn();
     releaseWakeLock();
     savePos();
@@ -957,6 +1001,8 @@
   }
 
   function speakFrom(i, offset = 0) {
+    if (cloudActive()) { cloudSpeakFrom(i); return; }
+    if (!audioEl.paused) audioEl.pause();
     clearTimers();
     const gen = ++st.gen;
     const S = doc.sentences;
@@ -1093,12 +1139,15 @@
   let restartTimer = 0;
   function restartSoon() {
     clearTimeout(restartTimer);
+    // クラウドの声は文ごとの音声なので、速度は再生速度を変えるだけでよい(作り直さないので使用量も増えない)
+    if (cloudActive()) { audioEl.playbackRate = settings.rate; return; }
     if (!st.playing) return;
     restartTimer = setTimeout(() => { if (st.playing) speakFrom(st.idx, st.wordPos); }, 250);
   }
 
   const durOf = (i) => doc.sentences[i].text.length / (CPS * settings.rate) + 0.25;
   function elapsedInCurrent() {
+    if (cloudActive() && st.audioIdx === st.idx) return audioEl.currentTime / settings.rate;
     let t = st.offset / (CPS * settings.rate);
     if (st.playing && st.started) t += (performance.now() - st.uttStart) / 1000;
     return Math.min(t, durOf(st.idx));
@@ -1106,6 +1155,11 @@
 
   function skipSeconds(sec) {
     if (!doc || !doc.sentences.length) return;
+    // クラウドの声で、移動先がいまの文の音声の中なら、その中で正確に移動する
+    if (cloudActive() && st.audioIdx === st.idx && audioEl.duration) {
+      const target = audioEl.currentTime + sec * settings.rate;
+      if (target >= 0 && target < audioEl.duration - 0.3) { audioEl.currentTime = target; return; }
+    }
     const n = doc.sentences.length;
     let i = st.idx;
     if (sec < 0) {
@@ -1134,6 +1188,315 @@
     const b = $('#playBtn');
     b.classList.toggle('playing', st.playing);
     b.setAttribute('aria-label', st.playing ? '一時停止' : '再生');
+    if ('mediaSession' in navigator) {
+      try { navigator.mediaSession.playbackState = st.playing ? 'playing' : 'paused'; } catch { /* noop */ }
+    }
+  }
+
+  // ---------------------------------------------------------------- cloud voice (Google Cloud Text-to-Speech)
+  const CLOUD_FREE = 1000000; // Chirp 3: HD の毎月の無料枠(文字数。空白や改行も数える)
+  const CLOUD_PRICE_PER_M = 30; // 無料枠を超えたときの100万文字あたりの料金(米ドル)
+  const TTS_API = 'https://texttospeech.googleapis.com/v1/';
+  const audioEl = new Audio();
+  audioEl.preload = 'auto';
+  const audioUrls = new Map(); // 保存キー → objectURL(起動中だけ)
+  const audioPending = new Map();
+  let cloudVoices = store.get('cloudVoices', null);
+
+  const cloudActive = () => settings.engine === 'cloud' && !!settings.cloudKey && !st.cloudError && !limitReached();
+
+  // 次の文が上限に収まらなかったら、その月は(上限を変えるまで)上限に達したものとして扱う
+  function limitReached() {
+    if (usageThisMonth() >= settings.cloudLimit) return true;
+    const hit = store.get('limitHit', null);
+    return !!hit && hit.month === monthKey() && hit.limit === settings.cloudLimit;
+  }
+  const cloudVoiceShort = (name) => name.replace(/^.*-Chirp3-HD-/, '');
+  const cloudLang = (name) => (name.match(/^[a-z]{2}-[A-Z]{2}/) || ['en-US'])[0];
+
+  // Googleの請求月は米国太平洋時間で区切られる
+  function monthKey() {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit' }).formatToParts(new Date());
+    const get = (type) => parts.find((p) => p.type === type).value;
+    return `${get('year')}-${get('month')}`;
+  }
+  const usageThisMonth = () => store.get('usage:' + monthKey(), 0);
+
+  function addUsage(chars) {
+    const before = usageThisMonth();
+    const after = before + chars;
+    store.set('usage:' + monthKey(), after);
+    for (const r of [0.5, 0.8, 0.9]) {
+      if (before < CLOUD_FREE * r && after >= CLOUD_FREE * r) toast(`クラウドの声:今月の無料枠の${r * 100}%を使いました`);
+    }
+    renderUsage();
+  }
+
+  async function ttsFetch(path, body) {
+    let res;
+    try {
+      res = await fetch(TTS_API + path, {
+        method: body ? 'POST' : 'GET',
+        headers: Object.assign({ 'X-Goog-Api-Key': settings.cloudKey }, body ? { 'Content-Type': 'application/json' } : {}),
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch (e) {
+      const err = new Error('network');
+      err.code = 'network';
+      throw err;
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error((data.error && data.error.message) || 'HTTP ' + res.status);
+      err.code = res.status;
+      err.reason = (data.error && data.error.details && data.error.details[0] && data.error.details[0].reason) || '';
+      throw err;
+    }
+    return data;
+  }
+
+  async function synthesize(text, voiceName) {
+    if (usageThisMonth() + text.length > settings.cloudLimit) {
+      const err = new Error('limit');
+      err.code = 'limit';
+      throw err;
+    }
+    const data = await ttsFetch('text:synthesize', {
+      input: { text },
+      voice: { languageCode: cloudLang(voiceName), name: voiceName },
+      audioConfig: { audioEncoding: 'MP3' },
+    });
+    addUsage(text.length);
+    const bin = atob(data.audioContent);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: 'audio/mpeg' });
+  }
+
+  // 一度作った音声は端末に保存して使い回す(読み直しや巻き戻しで使用量が増えないように)
+  function getAudioUrl(text, voiceName = settings.cloudVoice) {
+    const key = voiceName + '|' + text;
+    if (audioUrls.has(key)) return Promise.resolve(audioUrls.get(key));
+    if (audioPending.has(key)) return audioPending.get(key);
+    const p = (async () => {
+      let blob = await library.audioGet(key).catch(() => null);
+      if (!blob) {
+        blob = await synthesize(text, voiceName);
+        library.audioPut(key, blob).catch(() => {});
+      }
+      const url = URL.createObjectURL(blob);
+      audioUrls.set(key, url);
+      if (audioUrls.size > 80) {
+        const [oldKey, oldUrl] = audioUrls.entries().next().value;
+        if (audioEl.src !== oldUrl) URL.revokeObjectURL(oldUrl);
+        audioUrls.delete(oldKey);
+      }
+      return url;
+    })().finally(() => audioPending.delete(key));
+    audioPending.set(key, p);
+    return p;
+  }
+
+  // 無音の短いWAV。最初のタップで再生して、iOSで音声要素を使えるようにする
+  function silentWavUrl() {
+    const n = 800;
+    const buf = new ArrayBuffer(44 + n);
+    const v = new DataView(buf);
+    const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVE'); str(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+    str(36, 'data'); v.setUint32(40, n, true);
+    for (let i = 0; i < n; i++) v.setUint8(44 + i, 128);
+    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  }
+  function unlockAudio() {
+    if (st.unlock) return;
+    audioEl.src = silentWavUrl();
+    st.unlock = audioEl.play().catch(() => {});
+  }
+
+  async function cloudSpeakFrom(i) {
+    clearTimers();
+    const gen = ++st.gen;
+    const S = doc.sentences;
+    st.idx = clamp(i, 0, S.length - 1);
+    st.offset = st.wordPos = 0;
+    st.started = false;
+    markCurrent();
+    savePosSoon();
+    if (synth && (synth.speaking || synth.pending)) synth.cancel();
+    const idx = st.idx;
+    let url;
+    try {
+      url = await getAudioUrl(S[idx].text);
+      if (st.unlock) await st.unlock;
+    } catch (e) {
+      if (gen === st.gen) cloudFailed(e, idx);
+      return;
+    }
+    if (gen !== st.gen || !st.playing) return;
+    st.audioIdx = idx;
+    audioEl.src = url;
+    audioEl.defaultPlaybackRate = audioEl.playbackRate = settings.rate;
+    try {
+      await audioEl.play();
+    } catch (e) {
+      if (gen !== st.gen) return;
+      pause();
+      toast('再生を始められませんでした。もう一度再生ボタンを押してください');
+      return;
+    }
+    if (gen !== st.gen) return;
+    st.started = true;
+    st.uttStart = performance.now();
+    // 先の数文を用意しておく(画面ロック中でも途切れにくくする)
+    for (let k = idx + 1; k <= idx + 3 && k < S.length; k++) getAudioUrl(S[k].text).catch(() => {});
+  }
+
+  audioEl.addEventListener('ended', () => {
+    if (st.playing && st.audioIdx === st.idx && cloudActive()) onSentenceEnd(st.gen);
+  });
+  audioEl.addEventListener('play', () => { audioEl.playbackRate = settings.rate; });
+
+  function cloudErrorMessage(e) {
+    if (e.code === 'network') return '通信できなかったので、端末の声に切り替えました';
+    if (e.reason === 'API_KEY_INVALID') return 'APIキーが正しくないので、端末の声に切り替えました';
+    if (e.code === 403 && /billing/i.test(e.message)) return 'Google Cloudで請求先アカウントの設定が必要です。端末の声に切り替えました';
+    if (e.code === 403) return 'Text-to-Speech APIが有効でないか、キーの制限で拒否されました。端末の声に切り替えました';
+    if (e.code === 429) return '利用回数の制限に達したので、端末の声に切り替えました';
+    return 'クラウドの声でエラーが起きたので、端末の声に切り替えました';
+  }
+
+  // 上限に達したときやエラーのときは、端末の声でそのまま読み続ける
+  function cloudFailed(e, idx) {
+    console.warn('cloud voice', e);
+    if (e.code === 'limit') {
+      store.set('limitHit', { month: monthKey(), limit: settings.cloudLimit });
+      toast('今月の上限に達したので、端末の声に切り替えました');
+    } else {
+      st.cloudError = true;
+      st.cloudErrorMsg = cloudErrorMessage(e);
+      toast(st.cloudErrorMsg);
+    }
+    updateVoiceLabel();
+    renderUsage();
+    if (st.playing) speakFrom(idx, 0);
+  }
+
+  async function loadCloudVoices() {
+    const box = $('#cloudVoiceList');
+    if (!settings.cloudKey) { renderCloudVoices(); return; }
+    box.innerHTML = '<p class="note">声の一覧を読み込んでいます…</p>';
+    try {
+      const data = await ttsFetch('voices');
+      cloudVoices = (data.voices || [])
+        .filter((v) => /-Chirp3-HD-/.test(v.name) && v.ssmlGender === 'FEMALE' && /^en-/.test(v.name))
+        .map((v) => ({ name: v.name, lang: cloudLang(v.name) }));
+      store.set('cloudVoices', cloudVoices);
+      st.cloudError = false;
+      renderCloudVoices();
+      renderUsage();
+      updateVoiceLabel();
+    } catch (e) {
+      box.innerHTML = `<p class="note warn">${esc(e.reason === 'API_KEY_INVALID' ? 'APIキーが正しくありません。' : e.code === 403 ? 'Text-to-Speech APIが有効になっていないか、キーの制限で拒否されました。' : e.code === 'network' ? '通信できませんでした。' : 'エラー: ' + e.message)}</p>`;
+    }
+  }
+
+  function renderCloudVoices() {
+    const box = $('#cloudVoiceList');
+    if (!settings.cloudKey) { box.innerHTML = '<p class="note">APIキーを入れると、声の一覧が出ます。</p>'; return; }
+    const list = (cloudVoices && cloudVoices.length ? cloudVoices : ['Aoede', 'Kore', 'Leda', 'Zephyr'].map((n) => ({ name: `en-US-Chirp3-HD-${n}`, lang: 'en-US' })))
+      .slice().sort((a, b) => (a.lang === 'en-US' ? 0 : 1) - (b.lang === 'en-US' ? 0 : 1) || a.lang.localeCompare(b.lang) || a.name.localeCompare(b.name));
+    box.innerHTML = '<div class="voice-group">女性の声(Chirp 3 HD)</div>' + list.map((v) => `
+      <button type="button" class="voice" role="radio" aria-checked="${v.name === settings.cloudVoice}" data-cloud="${esc(v.name)}">
+        <span class="voice-dot"></span>
+        <span class="voice-body"><span class="voice-name">${esc(cloudVoiceShort(v.name))}</span><span class="voice-lang">${esc(langLabel(v.lang))}</span></span>
+      </button>`).join('');
+  }
+
+  async function previewCloudVoice() {
+    if (st.playing || !cloudActive()) return;
+    unlockAudio();
+    try {
+      const url = await getAudioUrl('Hello! I will read your PDF aloud in this voice.');
+      if (st.unlock) await st.unlock;
+      if (st.playing) return;
+      st.audioIdx = -1;
+      audioEl.src = url;
+      audioEl.playbackRate = settings.rate;
+      await audioEl.play();
+    } catch (e) {
+      if (e.code === 'limit') { store.set('limitHit', { month: monthKey(), limit: settings.cloudLimit }); renderUsage(); updateVoiceLabel(); toast('今月の上限に達しているので試聴できません'); }
+      else toast(cloudErrorMessage(e).replace('、端末の声に切り替えました', ''));
+    }
+  }
+
+  function renderUsage() {
+    const used = usageThisMonth();
+    const [y, m] = monthKey().split('-');
+    $('#usageMonth').textContent = `${y}年${+m}月`;
+    $('#usageUsed').textContent = used.toLocaleString('en-US');
+    $('#usageFree').textContent = CLOUD_FREE.toLocaleString('en-US');
+    $('#usageFill').style.width = Math.min(100, used / CLOUD_FREE * 100) + '%';
+    $('#usageLimitMark').style.left = Math.min(100, settings.cloudLimit / CLOUD_FREE * 100) + '%';
+    const left = Math.max(0, settings.cloudLimit - used);
+    const hours = left / CPS / 3600;
+    let note;
+    if (limitReached()) note = `上限(${settings.cloudLimit.toLocaleString('en-US')}文字)に達したので、来月まで端末の声を使います。上限を上げると、また使えます。`;
+    else note = `上限の${settings.cloudLimit.toLocaleString('en-US')}文字まで、あと${left.toLocaleString('en-US')}文字(速度1.0で約${hours < 1 ? Math.max(1, Math.round(hours * 60)) + '分' : hours.toFixed(1) + '時間'})。上限に達すると自動で端末の声に切り替わります。`;
+    $('#usageNote').textContent = note;
+    $('#usageWarn').hidden = settings.cloudLimit <= CLOUD_FREE;
+    $('#cloudStatus').textContent = st.cloudError ? st.cloudErrorMsg || '' : '';
+    $('#cloudStatus').hidden = !st.cloudError;
+  }
+
+  function applyEngine() {
+    const cloud = settings.engine === 'cloud';
+    $$('#engineSeg button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.engine === settings.engine)));
+    $('#devicePanel').hidden = cloud;
+    $('#cloudPanel').hidden = !cloud;
+    $('#cloudKey').value = settings.cloudKey;
+    $('#cloudLimit').value = settings.cloudLimit;
+    if (cloud) { renderUsage(); renderCloudVoices(); }
+    updateVoiceLabel();
+  }
+
+  // 声の切り替え。再生中なら今の文から新しい声で読み直す
+  function switchEngine(engine) {
+    if (settings.engine === engine) return;
+    const wasPlaying = st.playing;
+    if (wasPlaying) pause();
+    settings.engine = engine;
+    st.cloudError = false;
+    st.audioIdx = -1;
+    saveSettings();
+    applyEngine();
+    if (engine === 'cloud' && settings.cloudKey && !cloudVoices) loadCloudVoices();
+    if (wasPlaying) play();
+  }
+
+  // ロック画面やイヤホンのボタンで操作できるようにする
+  function setupMediaSession() {
+    if (!('mediaSession' in navigator)) return;
+    const handlers = {
+      play: () => play(), pause: () => pause(),
+      previoustrack: () => prevSentence(), nexttrack: () => nextSentence(),
+      seekbackward: () => skipSeconds(-10), seekforward: () => skipSeconds(10),
+    };
+    for (const [action, fn] of Object.entries(handlers)) {
+      try { navigator.mediaSession.setActionHandler(action, fn); } catch { /* 未対応の操作 */ }
+    }
+  }
+  function updateMediaMeta() {
+    if (!('mediaSession' in navigator) || !doc || typeof MediaMetadata === 'undefined') return;
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: doc.name.replace(/\.pdf$/i, ''),
+        artist: 'pdfReader',
+        artwork: [{ src: 'icons/icon-512.png', sizes: '512x512', type: 'image/png' }],
+      });
+    } catch { /* noop */ }
   }
 
   // ---------------------------------------------------------------- position / bookmarks
@@ -1521,7 +1884,7 @@
     });
 
     $('#speedChip').addEventListener('click', () => openSheet('speedSheet'));
-    $('#voiceChip').addEventListener('click', () => { renderVoiceList(); openSheet('voiceSheet'); });
+    $('#voiceChip').addEventListener('click', () => { renderVoiceList(); applyEngine(); openSheet('voiceSheet'); });
     $('#menuBtn').addEventListener('click', () => { openSheet('menuSheet'); updateSleepUI(); });
     $('#repeatChip').addEventListener('click', () => {
       settings.repeat = !settings.repeat;
@@ -1573,6 +1936,45 @@
       onVoiceChanged();
       if (st.playing) restartSoon(); else previewVoice();
     });
+
+    // クラウドの声
+    $('#engineSeg').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-engine]');
+      if (b) switchEngine(b.dataset.engine);
+    });
+    $('#cloudKeyForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      settings.cloudKey = $('#cloudKey').value.trim();
+      st.cloudError = false;
+      saveSettings();
+      $('#cloudKey').blur();
+      updateVoiceLabel();
+      renderUsage();
+      loadCloudVoices();
+      toast(settings.cloudKey ? 'APIキーを保存しました' : 'APIキーを消しました');
+    });
+    $('#cloudKeyShow').addEventListener('click', () => {
+      const input = $('#cloudKey');
+      input.type = input.type === 'password' ? 'text' : 'password';
+      $('#cloudKeyShow').textContent = input.type === 'password' ? '表示' : '隠す';
+    });
+    $('#cloudLimit').addEventListener('change', (e) => {
+      settings.cloudLimit = clamp(Math.round(+e.target.value || 0), 0, CLOUD_FREE);
+      e.target.value = settings.cloudLimit;
+      saveSettings();
+      renderUsage();
+      updateVoiceLabel();
+    });
+    $('#cloudVoiceList').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-cloud]');
+      if (!b) return;
+      settings.cloudVoice = b.dataset.cloud;
+      saveSettings();
+      renderCloudVoices();
+      updateVoiceLabel();
+      if (st.playing && cloudActive()) cloudSpeakFrom(st.idx); else previewCloudVoice();
+    });
+    $('#cloudVoiceReload').addEventListener('click', loadCloudVoices);
 
     // メニューシート
     $$('#menuSheet [role="tab"]').forEach((t) => t.addEventListener('click', () => selectTab(t.dataset.tab)));
@@ -1658,7 +2060,7 @@
       if (st.playing) {
         acquireWakeLock();
         // バックグラウンドで止まっていたら、いまの文から再開する
-        if (synth && !synth.speaking && !synth.pending && !st.gapTimer && !st.speakTimer) speakFrom(st.idx, st.wordPos);
+        if (!cloudActive() && synth && !synth.speaking && !synth.pending && !st.gapTimer && !st.speakTimer) speakFrom(st.idx, st.wordPos);
       }
     });
     window.addEventListener('pagehide', savePos);
@@ -1674,8 +2076,10 @@
     applyRepeat();
     applySwitches();
     applyTranslate();
+    applyEngine();
     updateSleepUI();
     bind();
+    setupMediaSession();
     if (synth) {
       loadVoices();
       if ('onvoiceschanged' in synth) synth.addEventListener('voiceschanged', loadVoices);

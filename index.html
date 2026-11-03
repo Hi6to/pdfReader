@@ -145,7 +145,7 @@
     </div>
     <div class="quick-row">
       <button id="speedChip" class="chip" type="button" aria-label="読み上げの速さ"><b id="speedLabel">1.0×</b></button>
-      <button id="voiceChip" class="chip voice-chip" type="button" aria-label="声を選ぶ">声 <b id="voiceLabel">—</b></button>
+      <button id="voiceChip" class="chip voice-chip" type="button" aria-label="声を選ぶ"><svg class="i-cloud" viewBox="0 0 24 24" aria-hidden="true"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.994 5.994 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg><span class="voice-kind">声</span> <b id="voiceLabel">—</b></button>
       <button id="repeatChip" class="chip" type="button" aria-pressed="false" aria-label="1文リピート">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z"/></svg>1文
       </button>
@@ -184,12 +184,71 @@
 <!-- 声 -->
 <div id="voiceSheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="voiceTitle" hidden>
   <div class="sheet-head"><h3 id="voiceTitle">声</h3><button class="icon-btn sm close" type="button" data-close aria-label="閉じる"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="stroke" d="M6 6l12 12M18 6 6 18"/></svg></button></div>
-  <div class="field">
-    <div class="field-head"><label for="pitchRange">声の高さ</label><span id="pitchValue">1.00</span></div>
-    <input id="pitchRange" type="range" min="0.8" max="1.4" step="0.05" value="1">
+  <div class="seg wide" id="engineSeg" role="group" aria-label="声の種類">
+    <button type="button" data-engine="device" aria-pressed="true">端末の声(無料)</button>
+    <button type="button" data-engine="cloud" aria-pressed="false">クラウドの声</button>
   </div>
-  <div id="voiceList" class="voice-list" role="radiogroup" aria-label="声の一覧"></div>
-  <p class="note">タップすると試し読みします。声の高さは1.00がいちばん自然に聞こえます。iPhoneの「設定 › アクセシビリティ › 読み上げコンテンツ › 声 › 英語」で声を追加できますが、ブラウザからは使えない声もあります(追加後にこの一覧に出てくれば使えます)。</p>
+
+  <div id="devicePanel">
+    <div class="field">
+      <div class="field-head"><label for="pitchRange">声の高さ</label><span id="pitchValue">1.00</span></div>
+      <input id="pitchRange" type="range" min="0.8" max="1.4" step="0.05" value="1">
+    </div>
+    <div id="voiceList" class="voice-list" role="radiogroup" aria-label="声の一覧"></div>
+    <p class="note">タップすると試し読みします。声の高さは1.00がいちばん自然に聞こえます。iPhoneの「設定 › アクセシビリティ › 読み上げコンテンツ › 声 › 英語」で声を追加できますが、ブラウザからは使えない声もあります(追加後にこの一覧に出てくれば使えます)。</p>
+  </div>
+
+  <div id="cloudPanel" hidden>
+    <section class="usage" aria-labelledby="usageTitle">
+      <div class="usage-head"><h4 id="usageTitle">今月の使用量</h4><span id="usageMonth"></span></div>
+      <div class="usage-nums"><b id="usageUsed">0</b> / <span id="usageFree">1,000,000</span> 文字(無料枠)</div>
+      <div class="usage-bar" aria-hidden="true"><span id="usageFill"></span><i id="usageLimitMark"></i></div>
+      <p id="usageNote" class="note"></p>
+      <p id="usageWarn" class="note warn" hidden>上限が無料枠を超えています。超えた分は100万文字あたり約30ドルかかります。</p>
+      <p id="cloudStatus" class="note warn" hidden></p>
+    </section>
+
+    <form id="cloudKeyForm" class="field">
+      <label for="cloudKey" class="field-label">Google Cloud の APIキー</label>
+      <div class="key-row">
+        <input id="cloudKey" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="AIza…">
+        <button id="cloudKeyShow" type="button" class="chip sm">表示</button>
+        <button type="submit" class="chip sm">保存</button>
+      </div>
+      <p class="note">キーはこの端末のブラウザにだけ保存されます。</p>
+    </form>
+
+    <div class="field">
+      <label for="cloudLimit" class="field-label">上限(この文字数に達したら端末の声に戻す)</label>
+      <div class="key-row">
+        <input id="cloudLimit" type="number" inputmode="numeric" min="0" max="1000000" step="10000">
+        <span class="unit">文字/月</span>
+      </div>
+    </div>
+
+    <div class="voice-tools"><button id="cloudVoiceReload" type="button" class="chip sm">声の一覧を更新</button></div>
+    <div id="cloudVoiceList" class="voice-list" role="radiogroup" aria-label="クラウドの声の一覧"></div>
+
+    <ul class="help">
+      <li>声は Google の Chirp 3 HD です。毎月100万文字まで無料で、空白も1文字に数えます。</li>
+      <li>一度読んだ文の音声は端末に保存して使い回すので、巻き戻しや読み直しでは使用量は増えません。速度を変えても増えません。</li>
+      <li>使用量はこの端末で数えた値です。ほかの端末でも同じキーを使うなら、Google Cloud の「お支払い」画面でも確認してください。</li>
+      <li>画面をロックしても読み上げが続きやすく、ロック画面から一時停止や文の移動もできます。</li>
+    </ul>
+
+    <details class="tips">
+      <summary>APIキーの作り方</summary>
+      <ol>
+        <li><a href="https://console.cloud.google.com/" target="_blank" rel="noopener">Google Cloud Console</a> にログインし、プロジェクトを作ります。</li>
+        <li>「お支払い」で請求先アカウントを作ります(クレジットカードの登録が必要。無料枠の中なら請求はありません)。</li>
+        <li>「APIとサービス › ライブラリ」で「Cloud Text-to-Speech API」を有効にします。</li>
+        <li>「APIとサービス › 認証情報」で「認証情報を作成 › APIキー」を選びます。</li>
+        <li>作ったキーの設定で、「APIの制限」を Cloud Text-to-Speech API だけに、「ウェブサイトの制限」を <code>https://hi6to.github.io/*</code> にします。</li>
+        <li>念のため「お支払い › 予算とアラート」で、予算100円などのアラートを作っておくと、課金が発生したときにメールで分かります。</li>
+        <li>キーをこの画面に貼り付けて「保存」を押します。</li>
+      </ol>
+    </details>
+  </div>
 </div>
 
 <!-- その他 -->

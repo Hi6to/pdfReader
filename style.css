@@ -683,3 +683,48 @@ input[type="range"]::-moz-range-thumb {
 .trans-text { margin: 2px 0 0; font-size: 15.5px; line-height: 1.6; color: var(--ink); }
 .trans-text.muted { color: var(--muted); }
 .link-btn { border: 0; background: none; color: var(--accent); text-decoration: underline; padding: 0 4px; font-size: inherit; }
+
+/* ---------- クラウドの声 ---------- */
+.seg.wide { display: flex; width: 100%; margin-bottom: 4px; }
+.seg.wide button { flex: 1; min-height: 38px; font-size: 14px; }
+.voice-chip .i-cloud { display: none; width: 18px; height: 18px; color: var(--accent); flex: none; }
+.voice-chip.cloud .i-cloud { display: block; }
+.voice-chip.cloud .voice-kind { display: none; }
+.usage {
+  margin-top: 14px;
+  padding: 14px;
+  border-radius: 14px;
+  background: var(--trans-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.usage-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.usage-head h4 { margin: 0; font-size: 14px; }
+.usage-head span { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.usage-nums { font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.usage-nums b { font-size: 22px; color: var(--ink); font-weight: 700; letter-spacing: -0.01em; }
+.usage-bar { position: relative; height: 10px; border-radius: 5px; background: var(--surface); border: 1px solid var(--line); overflow: visible; }
+.usage-bar span { display: block; height: 100%; width: 0; border-radius: 5px; background: var(--accent); }
+.usage-bar i { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; background: var(--danger); border-radius: 1px; }
+.usage .note { margin: 0; }
+.note.warn { color: var(--danger); }
+.field-label { display: block; font-size: 14px; margin-bottom: 6px; }
+.key-row { display: flex; align-items: center; gap: 6px; }
+.key-row input {
+  flex: 1;
+  min-width: 0;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+.unit { color: var(--muted); font-size: 14px; white-space: nowrap; }
+.voice-tools { display: flex; justify-content: flex-end; margin-top: 16px; }
+#cloudPanel .help { margin-top: 14px; }
+#cloudPanel .tips ol { padding-left: 1.3em; display: flex; flex-direction: column; gap: 8px; }
+#cloudPanel .tips a { color: var(--accent); }
+#cloudPanel .tips code { font-size: 12.5px; background: var(--surface-2); padding: 1px 4px; border-radius: 4px; word-break: break-all; }
