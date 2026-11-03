@@ -63,12 +63,13 @@
       if (!dbp) {
         dbp = new Promise((resolve, reject) => {
           try {
-            const req = indexedDB.open('pdfreader', 2);
+            const req = indexedDB.open('pdfreader', 3);
             req.onupgradeneeded = () => {
               const db = req.result;
               if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'id' });
               if (!db.objectStoreNames.contains('blobs')) db.createObjectStore('blobs', { keyPath: 'id' });
               if (!db.objectStoreNames.contains('audio')) db.createObjectStore('audio', { keyPath: 'key' }).createIndex('t', 't');
+              if (!db.objectStoreNames.contains('trans')) db.createObjectStore('trans', { keyPath: 'id' }); // PDFごとの訳 { id, map: {英文: 訳} }
             };
             req.onsuccess = () => resolve(req.result);
             req.onerror = () => reject(req.error);
@@ -105,10 +106,16 @@
         const r = t.objectStore('blobs').get(id);
         r.onsuccess = () => { box.value = r.result && r.result.data; };
       }),
-      remove: (id) => run(['meta', 'blobs'], 'readwrite', (t) => {
+      remove: (id) => run(['meta', 'blobs', 'trans'], 'readwrite', (t) => {
         t.objectStore('meta').delete(id);
         t.objectStore('blobs').delete(id);
+        t.objectStore('trans').delete(id);
       }),
+      transGet: (id) => run(['trans'], 'readonly', (t, box) => {
+        const r = t.objectStore('trans').get(id);
+        r.onsuccess = () => { box.value = r.result && r.result.map; };
+      }),
+      transPut: (id, map) => run(['trans'], 'readwrite', (t) => { t.objectStore('trans').put({ id, map, t: Date.now() }); }),
       audioGet: (key) => run(['audio'], 'readonly', (t, box) => {
         const r = t.objectStore('audio').get(key);
         r.onsuccess = () => { box.value = r.result && r.result.blob; };
@@ -673,6 +680,7 @@
     const id = (pdf.fingerprints && pdf.fingerprints[0]) || `${name}-${size}`;
     doc = { id, name, size, pdf, numPages: pdf.numPages, pages };
     Object.assign(doc, buildDoc(pages, buildOpts()));
+    await loadTrans(id); // 前に取った訳(保存済み)を読み込む
 
     const saved = store.get('pos:' + id, null);
     st.idx = saved ? restoreIndex(saved) : 0;
@@ -748,6 +756,7 @@
   function closeDoc() {
     stopSpeech();
     savePos();
+    saveTrans();
     if (doc && doc.pdf) doc.pdf.destroy();
     doc = null;
     spans = [];
@@ -2107,45 +2116,115 @@
   }
 
   // ---------------------------------------------------------------- translation
-  // 非公式のGoogle翻訳エンドポイント(キー不要・CORS可)。訳を表示する文だけを送る
-  const TRANSLATE_URL = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ja&dt=t&q=';
+  // 非公式のGoogle翻訳エンドポイント(キー不要・CORS可)。訳を表示するページの文だけを送る。
+  // この窓口は1つのIPアドレスから1時間に約100回で一時的に止められるので、
+  // 1ページ分をまとめて1回で取り、取った訳はPDFごとに端末(IndexedDB)へ保存して二度と取りに行かない
+  const TRANSLATE_URL = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ja&dt=t';
+  const TRANS_BATCH_CHARS = 4500; // 1回に送る文字数の上限
+  const TRANS_BLOCK_MS = 30 * 60000; // 止められたと分かったら、この間は取りに行かない
+  const TRANS_RETRY_MS = 60000; // 通信に失敗したら、この間は自動では取りに行かない
   const transCache = new Map(); // 英文 → 訳文
   const transPending = new Map(); // 英文 → Promise
+  let transFailedAt = 0;
+  let transLastError = null;
+  let transSaveTimer = 0;
+  let visibleAt = 0;
+
+  const transBlockedUntil = () => store.get('transBlockedUntil', 0);
+
+  function transError(kind, status) {
+    const e = new Error(kind);
+    e.kind = kind;
+    e.status = status;
+    return e;
+  }
 
   async function requestTranslation(texts) {
-    const res = await fetch(TRANSLATE_URL + encodeURIComponent(texts.join('\n')));
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
+    // iOS 18のSafariは、画面に戻った直後に始めた通信が失敗することがあるので少し待つ
+    const since = performance.now() - visibleAt;
+    if (since < 1500) await new Promise((r) => setTimeout(r, 1500 - since));
+    let res;
+    try {
+      // 長くなってもURLに入れずに済むようPOSTで送る(フォーム形式なのでCORSの事前確認も不要)
+      res = await fetch(TRANSLATE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+        body: 'q=' + encodeURIComponent(texts.join('\n')),
+      });
+    } catch {
+      throw transError('network'); // 通信できない、または広告ブロック・VPNなどで止められた
+    }
+    if (res.status === 429 || res.status === 403 || res.status === 503) throw transError('blocked', res.status);
+    if (!res.ok) throw transError('http', res.status);
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      throw transError('blocked', res.status); // 「通常と異なるトラフィック」のページが返ってきたとき
+    }
     const out = data[0].map((seg) => seg[0] || '').join('').replace(/[​-‍﻿]/g, '');
     return out.split('\n').map((s) => s.trim());
   }
 
-  // i番目から先の未翻訳の文を最大8文まとめて1回のリクエストで訳す(1行1文で送り、行で分け直す)
+  // 行数が合わなかったら半分ずつに分けて取り直す(1文ずつ取り直すより回数が少ない)
+  async function translateBatch(texts) {
+    const parts = await requestTranslation(texts);
+    if (parts.length === texts.length) return parts;
+    if (texts.length === 1) return [parts.join(' ')];
+    const mid = texts.length >> 1;
+    return [...await translateBatch(texts.slice(0, mid)), ...await translateBatch(texts.slice(mid))];
+  }
+
+  // i番目の文を含むページの、まだ訳していない文をまとめて1回で訳す
   function translateFrom(i) {
     const S = doc.sentences;
+    const page = S[i].page;
     const batch = [];
     let chars = 0;
-    for (let k = i; k < S.length && batch.length < 8; k++) {
+    const add = (k) => {
       const t = S[k].text;
-      if (transCache.has(t) || transPending.has(t) || batch.includes(t)) continue;
-      if (batch.length && chars + t.length > 1400) break;
+      if (transCache.has(t) || transPending.has(t) || batch.includes(t)) return true;
+      if (batch.length && chars + t.length > TRANS_BATCH_CHARS) return false;
       batch.push(t);
       chars += t.length;
-    }
+      return true;
+    };
+    add(i);
+    for (let k = i + 1; k < S.length && S[k].page === page; k++) if (!add(k)) break;
+    for (let k = i - 1; k >= 0 && S[k].page === page; k--) if (!add(k)) break;
     if (!batch.length) return null;
-    const p = requestTranslation(batch).then(async (parts) => {
-      if (parts.length === batch.length) {
-        batch.forEach((t, k) => transCache.set(t, parts[k]));
-      } else {
-        for (const t of batch) transCache.set(t, (await requestTranslation([t])).join(' '));
-      }
+    const p = translateBatch(batch).then((parts) => {
+      batch.forEach((t, k) => transCache.set(t, parts[k]));
+      transFailedAt = 0;
+      transLastError = null;
+      saveTransSoon();
+    }, (e) => {
+      transFailedAt = Date.now();
+      transLastError = e;
+      if (e.kind === 'blocked') store.set('transBlockedUntil', Date.now() + TRANS_BLOCK_MS);
+      throw e;
     }).finally(() => batch.forEach((t) => transPending.delete(t)));
     batch.forEach((t) => transPending.set(t, p));
     p.catch(() => {});
     return p;
   }
 
-  function showTranslation() {
+  // 取りに行けない理由の説明
+  function transProblem(force) {
+    const until = transBlockedUntil();
+    if (!force && until > Date.now()) {
+      const t = new Date(until);
+      return `Google翻訳が一時的に使えません(短い時間に使いすぎたため、このネットワークからの利用が制限されています)。${t.getHours()}:${String(t.getMinutes()).padStart(2, '0')}ごろに自動で再開します。Wi-Fiとモバイル通信を切り替えたり、iCloudプライベートリレーをオフにしたりすると直ることがあります。`;
+    }
+    if (!force && transFailedAt && Date.now() - transFailedAt < TRANS_RETRY_MS) {
+      return transLastError && transLastError.kind === 'http'
+        ? `訳を取得できませんでした(Google翻訳のエラー ${transLastError.status})。`
+        : '訳を取得できませんでした。通信できないか、広告ブロック・VPN・iCloudプライベートリレーなどで止められている可能性があります。';
+    }
+    return '';
+  }
+
+  function showTranslation(force) {
     const panel = $('#transPanel');
     panel.hidden = !settings.translate || !doc || !doc.sentences.length;
     if (panel.hidden) return;
@@ -2156,18 +2235,46 @@
     if (transCache.has(t)) {
       box.textContent = transCache.get(t);
       box.classList.remove('muted');
+      // ページの最後の文まで来たら、次のページの訳を用意しておく
       const next = S[i + 1];
-      if (next && !transCache.has(next.text) && !transPending.has(next.text)) translateFrom(i + 1);
+      if (next && !transCache.has(next.text) && !transPending.has(next.text) && !transProblem()) translateFrom(i + 1);
+      return;
+    }
+    // 止められている間や失敗した直後は、自動では取りに行かない(制限が長引かないように)
+    const problem = transProblem(force);
+    if (problem && !transPending.has(t)) {
+      box.innerHTML = `${esc(problem)} <button type="button" class="link-btn" data-retry>今すぐ試す</button>`;
+      box.classList.add('muted');
       return;
     }
     box.textContent = '訳しています…';
     box.classList.add('muted');
+    if (force) store.del('transBlockedUntil');
     const p = transPending.get(t) || translateFrom(i);
     if (!p) return;
-    p.then(() => { if (st.idx === i) showTranslation(); }).catch(() => {
-      if (st.idx !== i) return;
-      box.innerHTML = '訳を取得できませんでした。通信状態を確認してください。<button type="button" class="link-btn" data-retry>もう一度</button>';
-    });
+    p.then(() => { if (st.idx === i) showTranslation(); }).catch(() => { if (st.idx === i) showTranslation(); });
+  }
+
+  // 取った訳をPDFごとに保存する(少しまとめてから書く)
+  function saveTransSoon() {
+    clearTimeout(transSaveTimer);
+    transSaveTimer = setTimeout(saveTrans, 2000);
+  }
+  function saveTrans() {
+    clearTimeout(transSaveTimer);
+    if (!doc) return;
+    const map = {};
+    let n = 0;
+    for (const s of doc.sentences) {
+      if (transCache.has(s.text)) { map[s.text] = transCache.get(s.text); n++; }
+    }
+    if (n) library.transPut(doc.id, map).catch(() => {});
+  }
+  async function loadTrans(id) {
+    try {
+      const map = await library.transGet(id);
+      if (map) for (const [en, ja] of Object.entries(map)) transCache.set(en, ja);
+    } catch { /* 保存できない環境でも訳は取れる */ }
   }
 
   function applyTranslate() {
@@ -2181,7 +2288,7 @@
     applyTranslate();
     if (settings.translate && !store.get('transNoticed', false)) {
       store.set('transNoticed', true);
-      toast('訳はGoogle翻訳で作ります。表示する文と、その先の数文だけが送信されます');
+      toast('訳はGoogle翻訳で作ります。読んでいるページの文だけが送信され、訳は端末に保存されます');
     }
   }
 
@@ -2358,7 +2465,7 @@
     window.addEventListener('popstate', () => { if (doc) closeDoc(); });
 
     $('#transBtn').addEventListener('click', toggleTranslate);
-    $('#transPanel').addEventListener('click', (e) => { if (e.target.closest('[data-retry]')) showTranslation(); });
+    $('#transPanel').addEventListener('click', (e) => { if (e.target.closest('[data-retry]')) showTranslation(true); });
     $('#modeText').addEventListener('click', () => { settings.view = 'text'; saveSettings(); applyView(); });
     $('#modePdf').addEventListener('click', () => { settings.view = 'pdf'; saveSettings(); applyView(); });
 
@@ -2640,14 +2747,15 @@
     });
 
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden) { savePos(); return; }
+      if (document.hidden) { savePos(); saveTrans(); return; }
+      visibleAt = performance.now();
       if (st.playing) {
         acquireWakeLock();
         // バックグラウンドで止まっていたら、いまの文から再開する
         if (!cloudActive() && synth && !synth.speaking && !synth.pending && !st.gapTimer && !st.speakTimer) speakFrom(st.idx, st.wordPos);
       }
     });
-    window.addEventListener('pagehide', savePos);
+    window.addEventListener('pagehide', () => { savePos(); saveTrans(); });
   }
 
   // ---------------------------------------------------------------- init
