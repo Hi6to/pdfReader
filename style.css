@@ -728,3 +728,21 @@ input[type="range"]::-moz-range-thumb {
 #cloudPanel .tips ol { padding-left: 1.3em; display: flex; flex-direction: column; gap: 8px; }
 #cloudPanel .tips a { color: var(--accent); }
 #cloudPanel .tips code { font-size: 12.5px; background: var(--surface-2); padding: 1px 4px; border-radius: 4px; word-break: break-all; }
+
+/* 読み飛ばした数式の印 */
+.mathmark {
+  font-family: var(--font-ui);
+  font-size: 0.62em;
+  line-height: 1.5;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 0;
+  border-radius: 4px;
+  padding: 0.05em 0.45em;
+  margin-right: 0.3em;
+  vertical-align: 0.2em;
+  cursor: pointer;
+}
+.key-foot { display: flex; align-items: flex-start; gap: 8px; }
+.key-foot .note { flex: 1; min-width: 0; }
+.key-foot .chip { margin-top: 6px; flex: none; }

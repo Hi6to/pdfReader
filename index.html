@@ -18,7 +18,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&display=swap">
 <link rel="stylesheet" href="style.css">
-<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="vendor/pdfjs-3.11.174/pdf.min.js"></script>
 <script src="app.js" defer></script>
 </head>
 <body>
@@ -208,14 +208,19 @@
       <p id="cloudStatus" class="note warn" hidden></p>
     </section>
 
-    <form id="cloudKeyForm" class="field">
+    <iframe name="keySink" class="visually-hidden" tabindex="-1" aria-hidden="true" title="キー入力用"></iframe>
+    <form id="cloudKeyForm" class="field" method="post" action="about:blank" target="keySink">
       <label for="cloudKey" class="field-label">Google Cloud の APIキー</label>
+      <input type="text" name="username" autocomplete="username" value="Google Cloud TTS (pdfReader)" readonly class="visually-hidden" tabindex="-1" aria-hidden="true">
       <div class="key-row">
-        <input id="cloudKey" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="AIza…">
+        <input id="cloudKey" name="password" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" placeholder="AIza…">
         <button id="cloudKeyShow" type="button" class="chip sm">表示</button>
-        <button type="submit" class="chip sm">保存</button>
+        <button type="submit" class="chip sm">使う</button>
       </div>
-      <p class="note">キーはこの端末のブラウザにだけ保存されます。</p>
+      <div class="key-foot">
+        <p class="note">キーはブラウザに保存しません。アプリを閉じると消えるので、開くたびに入れてください。iPhoneのパスワード自動入力に保存しておくと、Face IDですぐ入れられます。</p>
+        <button id="cloudKeyClear" type="button" class="chip sm">消す</button>
+      </div>
     </form>
 
     <div class="field">
@@ -322,6 +327,7 @@
     <h4 class="group-label">読み上げ</h4>
     <label class="row" for="optHeaders"><span>ヘッダーやページ番号を読まない</span><input type="checkbox" class="switch" id="optHeaders"></label>
     <label class="row" for="optCites"><span>引用番号 [12] やURLを読まない</span><input type="checkbox" class="switch" id="optCites"></label>
+    <label class="row" for="optMath"><span>数式を読まない</span><input type="checkbox" class="switch" id="optMath"></label>
     <label class="row" for="optWake"><span>読み上げ中は画面を消さない</span><input type="checkbox" class="switch" id="optWake"></label>
 
     <h4 class="group-label">操作のヒント</h4>

@@ -7,8 +7,10 @@
   const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+  // PDF.jsのプログラムはリポジトリ内に置き、外部のスクリプトは読み込まない。
+  // 外部(jsDelivr)から取るのは、文字の対応表とフォントのデータだけ
   const PDFJS_BASE = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/';
-  pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_BASE + 'build/pdf.worker.min.js';
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdfjs-3.11.174/pdf.worker.min.js';
 
   // 速度1.0のときに1秒間に読まれるおおよその文字数(10秒スキップと残り時間の目安に使う)
   const CPS = 14.5;
@@ -38,15 +40,17 @@
 
   const DEFAULTS = {
     v: 2, rate: 1, pitch: 1, voiceURI: '', gap: 0, repeat: false,
-    engine: 'device', cloudKey: '', cloudVoice: 'en-US-Chirp3-HD-Aoede', cloudLimit: 900000,
+    engine: 'device', cloudVoice: 'en-US-Chirp3-HD-Aoede', cloudLimit: 900000,
     fontSize: 19, font: 'serif', theme: 'auto', wordHL: true, translate: false,
-    skipHeaders: true, skipCites: true, wakeLock: true, view: 'text',
+    skipHeaders: true, skipCites: true, skipMath: true, wakeLock: true, view: 'text',
   };
   const storedSettings = store.get('settings', {});
   // v1の初期値だった声の高さ1.05は、声が不自然になるので1.0に戻す
   if (!storedSettings.v && storedSettings.pitch === 1.05) storedSettings.pitch = 1;
   const settings = Object.assign({}, DEFAULTS, storedSettings, { v: DEFAULTS.v });
   const saveSettings = () => store.set('settings', settings);
+  // APIキーはブラウザに保存しない。以前の版で保存したキーが残っていれば消す
+  if ('cloudKey' in settings) { delete settings.cloudKey; saveSettings(); }
 
   // 開いたPDFの本体はIndexedDBに置く(metaは一覧用、blobsは中身、audioはクラウドの声で作った音声)
   const AUDIO_CACHE_MAX = 4000; // 保存しておく音声の数(1文あたり20KB前後)
@@ -269,8 +273,21 @@
     let lastItem = null;
     let lastLine = null;
 
+    let mathPending = null; // 直前に読み飛ばした数式の行があったページ
+    const mathMarks = []; // 読み飛ばした数式の位置 { pos, page }
+
     pages.forEach((p, pi) => {
-      const lines = p.lines.filter((l) => !(opt.skipHeaders && l.margin));
+      const lines = [];
+      for (const l of p.lines) {
+        if (opt.skipHeaders && l.margin) continue;
+        if (opt.skipMath && isMathLine(l.text)) {
+          if (mathPending == null) mathPending = pi;
+          continue;
+        }
+        l.mathBefore = mathPending;
+        mathPending = null;
+        lines.push(l);
+      }
       const gap = medianLineGap(lines);
       const widths = lines.map((l) => l.right - l.x).sort((a, b) => a - b);
       const medW = widths.length ? widths[widths.length >> 1] : 0;
@@ -278,9 +295,13 @@
       lines.forEach((line, li) => {
         if (T.length) {
           const prev = li > 0 ? lines[li - 1] : lastLine;
-          const para = li === 0
+          let para = li === 0
             ? ENDS_SENTENCE.test(T) || sizeChange(prev, line)
             : isParaBreak(prev, line, gap, medW, T);
+          if (line.mathBefore != null) {
+            mathMarks.push({ pos: T.length, page: line.mathBefore });
+            if (!ENDS_SENTENCE.test(T)) para = false; // 文の途中の数式なら、前後をつなげて1つの文にする
+          }
           if (para) {
             T = T.replace(/ +$/, '');
             if (lastItem) lastItem.end = Math.min(lastItem.end, T.length);
@@ -315,6 +336,7 @@
         lastLine = line;
       });
     });
+    if (mathPending != null) mathMarks.push({ pos: T.length, page: mathPending });
 
     const sentences = [];
     const paraStarts = [];
@@ -332,6 +354,13 @@
       }
       if (sentences.length > before) paraStarts.push(before);
       ps = pe + 1;
+    }
+
+    // 読み飛ばした数式は、その直前の文のうしろに印を出す(タップでPDF表示へ)
+    let si = 0;
+    for (const m of mathMarks) {
+      while (si + 1 < sentences.length && sentences[si + 1].a <= m.pos) si++;
+      if (sentences[si]) sentences[si].math = m.page;
     }
 
     const prefix = new Float64Array(sentences.length + 1);
@@ -402,7 +431,59 @@
         .replace(/\b(?:https?:\/\/|www\.)[^\s)\]]+/gi, 'link')
         .replace(/\bdoi:\s*\S+/gi, '');
     }
-    return t.replace(/\s+/g, ' ').trim();
+    t = t.replace(/\s+/g, ' ').trim();
+    if (opt.skipMath) t = stripInlineMath(t);
+    return t;
+  }
+
+  // ---------------------------------------------------------------- math
+  // 数式に使われる記号(ギリシャ文字と、文字に対応づけられていない記号=私用領域も含む)
+  const MATH_CHAR = /[=<>+±×÷·∗∘∑∏∫∮∂∇√∞≤≥≠≈≡∼≃≅∝∈∉∋⊂⊃⊆⊇∪∩∧∨¬∀∃→←↔⇒⇐⇔↦⊕⊗⊥∥∠⌊⌋⌈⌉⟨⟩‖|^_{}~−′″Α-Ωα-ωϑϕϰϱϵ-]/;
+  const MATH_CHAR_G = new RegExp(MATH_CHAR.source, 'g');
+  const MATH_WORDS = new Set('log exp sin cos tan max min arg lim det sup inf mod softmax sigmoid relu tanh var cov diag dim ker'.split(' '));
+  const SHORT_WORDS = new Set('a i an as at be by do if in is it of on or so to up we us no he me my'.split(' '));
+
+  // 行全体が数式か(独立した数式の行、式番号だけの行、∑の上下の添字など)
+  function isMathLine(text) {
+    const t = text.trim();
+    if (!t) return false;
+    if (/^\(\d{1,3}(\.\d{1,3})?[a-z]?\)$/.test(t)) return true;
+    const words = (t.match(/[A-Za-z]{3,}/g) || []).filter((w) => !MATH_WORDS.has(w.toLowerCase()));
+    const sym = (t.match(MATH_CHAR_G) || []).length;
+    if (!words.length) return sym > 0 || (t.length <= 12 && /[A-Za-z]/.test(t) && !/[a-z]{2,}/.test(t));
+    if (sym >= 3 && words.length <= 2) return true;
+    return sym / t.replace(/\s/g, '').length > 0.2 && words.length <= 4;
+  }
+
+  // 変数や数値のような短いトークン(数式記号のとなりにあれば一緒に消す)
+  function isVarToken(w) {
+    const core = w.replace(/^[([{]+|[)\]},.;:]+$/g, '');
+    if (!core) return true;
+    if (/^[\d.,]+$/.test(core)) return true;
+    return /^[A-Za-z]{1,2}\d*$/.test(core) && !SHORT_WORDS.has(core.toLowerCase());
+  }
+
+  // 文の中の数式(「where x ∈ R^d is」の「x ∈ R^d」など)を取り除く
+  function stripInlineMath(t) {
+    if (!MATH_CHAR.test(t)) return t;
+    const toks = t.split(' ');
+    const drop = toks.map((w) => MATH_CHAR.test(w));
+    toks.forEach((w, k) => {
+      if (!MATH_CHAR.test(w)) return;
+      for (let j = k - 1; j >= 0 && !drop[j] && isVarToken(toks[j]); j--) drop[j] = true;
+      for (let j = k + 1; j < toks.length && !drop[j] && isVarToken(toks[j]); j++) drop[j] = true;
+    });
+    const out = [];
+    for (let k = 0; k < toks.length; k++) {
+      if (!drop[k]) { out.push(toks[k]); continue; }
+      let e = k;
+      while (e + 1 < toks.length && drop[e + 1]) e++;
+      // 消した範囲の最後にあった句読点は残す
+      const punct = (toks[e].match(/([.,;:!?])[)\]"'”’]*$/) || [])[1];
+      if (punct && out.length && !/[.,;:!?]$/.test(out[out.length - 1])) out[out.length - 1] += punct;
+      k = e;
+    }
+    return out.join(' ');
   }
 
   // items は start 順。pos を含む(または pos 以降で最初の)項目の位置を返す
@@ -612,6 +693,7 @@
           lastPage = s.page;
         }
         html += `<span class="s" data-i="${i}">${esc(s.text)}</span> `;
+        if (s.math != null) html += `<button type="button" class="mathmark" data-math-page="${s.math + 1}" aria-label="読み飛ばした数式をPDFで見る(${s.math + 1}ページ)">数式</button> `;
       }
       const heading = s1 - s0 === 1 && S[s0].text.length < 90 && !/[.!?:;,]["”’)]?$/.test(S[s0].text);
       parts.push(heading ? `<p class="h">${html}</p>` : `<p>${html}</p>`);
@@ -962,6 +1044,10 @@
   function play() {
     if (!doc || !doc.sentences.length) return;
     if (!synth && !cloudActive()) { toast('このブラウザは音声読み上げに対応していません'); return; }
+    if (settings.engine === 'cloud' && !cloudKey && !keyNagged) {
+      keyNagged = true;
+      toast('クラウドの声を使うには「声」でAPIキーを入れてください。今は端末の声で読みます');
+    }
     st.playing = true;
     st.errors = 0;
     st.retries = 0;
@@ -1202,8 +1288,11 @@
   const audioUrls = new Map(); // 保存キー → objectURL(起動中だけ)
   const audioPending = new Map();
   let cloudVoices = store.get('cloudVoices', null);
+  // APIキーはメモリにだけ持つ(localStorageなどには書かない)。ページを閉じると消える
+  let cloudKey = '';
+  let keyNagged = false;
 
-  const cloudActive = () => settings.engine === 'cloud' && !!settings.cloudKey && !st.cloudError && !limitReached();
+  const cloudActive = () => settings.engine === 'cloud' && !!cloudKey && !st.cloudError && !limitReached();
 
   // 次の文が上限に収まらなかったら、その月は(上限を変えるまで)上限に達したものとして扱う
   function limitReached() {
@@ -1237,7 +1326,7 @@
     try {
       res = await fetch(TTS_API + path, {
         method: body ? 'POST' : 'GET',
-        headers: Object.assign({ 'X-Goog-Api-Key': settings.cloudKey }, body ? { 'Content-Type': 'application/json' } : {}),
+        headers: Object.assign({ 'X-Goog-Api-Key': cloudKey }, body ? { 'Content-Type': 'application/json' } : {}),
         body: body ? JSON.stringify(body) : undefined,
       });
     } catch (e) {
@@ -1386,7 +1475,7 @@
 
   async function loadCloudVoices() {
     const box = $('#cloudVoiceList');
-    if (!settings.cloudKey) { renderCloudVoices(); return; }
+    if (!cloudKey) { renderCloudVoices(); return; }
     box.innerHTML = '<p class="note">声の一覧を読み込んでいます…</p>';
     try {
       const data = await ttsFetch('voices');
@@ -1405,7 +1494,7 @@
 
   function renderCloudVoices() {
     const box = $('#cloudVoiceList');
-    if (!settings.cloudKey) { box.innerHTML = '<p class="note">APIキーを入れると、声の一覧が出ます。</p>'; return; }
+    if (!cloudKey) { box.innerHTML = '<p class="note">APIキーを入れると、声の一覧が出ます。</p>'; return; }
     const list = (cloudVoices && cloudVoices.length ? cloudVoices : ['Aoede', 'Kore', 'Leda', 'Zephyr'].map((n) => ({ name: `en-US-Chirp3-HD-${n}`, lang: 'en-US' })))
       .slice().sort((a, b) => (a.lang === 'en-US' ? 0 : 1) - (b.lang === 'en-US' ? 0 : 1) || a.lang.localeCompare(b.lang) || a.name.localeCompare(b.name));
     box.innerHTML = '<div class="voice-group">女性の声(Chirp 3 HD)</div>' + list.map((v) => `
@@ -1456,7 +1545,7 @@
     $$('#engineSeg button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.engine === settings.engine)));
     $('#devicePanel').hidden = cloud;
     $('#cloudPanel').hidden = !cloud;
-    $('#cloudKey').value = settings.cloudKey;
+    $('#cloudKey').value = cloudKey;
     $('#cloudLimit').value = settings.cloudLimit;
     if (cloud) { renderUsage(); renderCloudVoices(); }
     updateVoiceLabel();
@@ -1472,7 +1561,7 @@
     st.audioIdx = -1;
     saveSettings();
     applyEngine();
-    if (engine === 'cloud' && settings.cloudKey && !cloudVoices) loadCloudVoices();
+    if (engine === 'cloud' && cloudKey && !cloudVoices) loadCloudVoices();
     if (wasPlaying) play();
   }
 
@@ -1760,6 +1849,7 @@
     $('#optWord').checked = settings.wordHL;
     $('#optHeaders').checked = settings.skipHeaders;
     $('#optCites').checked = settings.skipCites;
+    $('#optMath').checked = settings.skipMath;
     $('#optWake').checked = settings.wakeLock;
   }
 
@@ -1811,6 +1901,16 @@
     $('#modePdf').addEventListener('click', () => { settings.view = 'pdf'; saveSettings(); applyView(); });
 
     $('#textView').addEventListener('click', (e) => {
+      const mark = e.target.closest('[data-math-page]');
+      if (mark) {
+        // 読み飛ばした数式のページをPDF表示で開く
+        settings.view = 'pdf';
+        saveSettings();
+        applyView();
+        st.pdfFollow = false;
+        renderPdfPage(+mark.dataset.mathPage);
+        return;
+      }
       const sp = e.target.closest('.s');
       if (!sp) return;
       const sel = window.getSelection && window.getSelection();
@@ -1942,16 +2042,25 @@
       const b = e.target.closest('[data-engine]');
       if (b) switchEngine(b.dataset.engine);
     });
-    $('#cloudKeyForm').addEventListener('submit', (e) => {
-      e.preventDefault();
-      settings.cloudKey = $('#cloudKey').value.trim();
+    // フォームは見えないiframeに送信する(ページは移動しない)。ふつうのログインフォームと同じ形にして、
+    // iPhoneのパスワード自動入力(iCloudキーチェーン)にキーを保存・入力できるようにするため
+    $('#cloudKeyForm').addEventListener('submit', () => {
+      cloudKey = $('#cloudKey').value.trim();
       st.cloudError = false;
-      saveSettings();
       $('#cloudKey').blur();
       updateVoiceLabel();
       renderUsage();
       loadCloudVoices();
-      toast(settings.cloudKey ? 'APIキーを保存しました' : 'APIキーを消しました');
+      toast(cloudKey ? 'APIキーを入れました(保存はせず、アプリを閉じると消えます)' : 'APIキーを消しました');
+    });
+    $('#cloudKeyClear').addEventListener('click', () => {
+      cloudKey = '';
+      $('#cloudKey').value = '';
+      if (st.playing && settings.engine === 'cloud') { pause(); }
+      updateVoiceLabel();
+      renderUsage();
+      renderCloudVoices();
+      toast('APIキーを消しました');
     });
     $('#cloudKeyShow').addEventListener('click', () => {
       const input = $('#cloudKey');
@@ -2037,6 +2146,7 @@
     });
     $('#optHeaders').addEventListener('change', (e) => { settings.skipHeaders = e.target.checked; saveSettings(); rebuild(); });
     $('#optCites').addEventListener('change', (e) => { settings.skipCites = e.target.checked; saveSettings(); rebuild(); });
+    $('#optMath').addEventListener('change', (e) => { settings.skipMath = e.target.checked; saveSettings(); rebuild(); });
     $('#optWake').addEventListener('change', (e) => {
       settings.wakeLock = e.target.checked;
       saveSettings();
