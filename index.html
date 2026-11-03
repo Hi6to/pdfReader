@@ -53,6 +53,7 @@
           <li>声は iPhone の「設定 › アクセシビリティ › 読み上げコンテンツ › 声 › 英語」で追加できます。高音質版をダウンロードすると、声の一覧に出てくる場合があります。</li>
           <li>画面をロックすると読み上げが止まることがあります。読み上げ中は画面を消さない設定がおすすめです(設定はメニュー内)。</li>
           <li>テキスト表示で文をタップすると、そこから読み上げます。長押しで単語を選べば、iPhone標準の「調べる」「翻訳」が使えます。</li>
+          <li>上の「訳」ボタンで、読んでいる文の日本語訳を表示できます。訳はGoogle翻訳で作るので、表示する文とその先の数文だけがGoogleに送られます。</li>
         </ul>
       </details>
     </div>
@@ -69,6 +70,7 @@
       <div id="docTitle" class="doc-title"></div>
       <div id="sleepBadge" class="sleep-badge" hidden></div>
     </div>
+    <button id="transBtn" class="trans-btn" type="button" aria-pressed="false" aria-label="日本語訳を表示">訳</button>
     <div class="seg" role="group" aria-label="表示の切り替え">
       <button type="button" id="modeText" data-mode="text" aria-pressed="true">テキスト</button>
       <button type="button" id="modePdf" data-mode="pdf" aria-pressed="false">PDF</button>
@@ -108,6 +110,13 @@
       </div>
     </main>
     <button id="followBtn" class="follow-btn" type="button" hidden>読んでいる位置へ</button>
+  </div>
+
+  <div id="transPanel" class="trans-panel" hidden>
+    <div class="trans-inner">
+      <div class="trans-head"><span>日本語訳</span><span>Google翻訳</span></div>
+      <p id="transText" class="trans-text" lang="ja"></p>
+    </div>
   </div>
 
   <footer class="player">
@@ -260,7 +269,8 @@
     <ul class="help">
       <li><b>前の文</b>:文の途中なら文頭へ、文頭なら1つ前の文へ戻ります。</li>
       <li><b>10秒戻る/進む</b>:文字数から計算したおおよその時間です。</li>
-      <li>キーボード:スペースで再生/停止、← → で文単位、Shift+← → で10秒。</li>
+      <li><b>訳</b>:画面上の「訳」ボタンで、読んでいる文の日本語訳を表示します。表示する文とその先の数文だけがGoogle翻訳に送られます。</li>
+      <li>キーボード:スペースで再生/停止、← → で文単位、Shift+← → で10秒、T で訳の表示。</li>
     </ul>
   </div>
 </div>

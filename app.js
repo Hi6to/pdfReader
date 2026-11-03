@@ -35,7 +35,7 @@
 
   const DEFAULTS = {
     rate: 1, pitch: 1.05, voiceURI: '', gap: 0, repeat: false,
-    fontSize: 19, font: 'serif', theme: 'auto', wordHL: true,
+    fontSize: 19, font: 'serif', theme: 'auto', wordHL: true, translate: false,
     skipHeaders: true, skipCites: true, wakeLock: true, view: 'text',
   };
   const settings = Object.assign({}, DEFAULTS, store.get('settings', {}));
@@ -613,6 +613,7 @@
     if (settings.view === 'pdf') showPdfSentence();
     else followText(false);
     updateProgress();
+    showTranslation();
   }
 
   function markWord(pos, len) {
@@ -1139,6 +1140,85 @@
     }).join('') + (hits.length >= 100 ? '<li><p class="note">最初の100件を表示しています</p></li>' : '');
   }
 
+  // ---------------------------------------------------------------- translation
+  // 非公式のGoogle翻訳エンドポイント(キー不要・CORS可)。訳を表示する文だけを送る
+  const TRANSLATE_URL = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ja&dt=t&q=';
+  const transCache = new Map(); // 英文 → 訳文
+  const transPending = new Map(); // 英文 → Promise
+
+  async function requestTranslation(texts) {
+    const res = await fetch(TRANSLATE_URL + encodeURIComponent(texts.join('\n')));
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const out = data[0].map((seg) => seg[0] || '').join('').replace(/[​-‍﻿]/g, '');
+    return out.split('\n').map((s) => s.trim());
+  }
+
+  // i番目から先の未翻訳の文を最大8文まとめて1回のリクエストで訳す(1行1文で送り、行で分け直す)
+  function translateFrom(i) {
+    const S = doc.sentences;
+    const batch = [];
+    let chars = 0;
+    for (let k = i; k < S.length && batch.length < 8; k++) {
+      const t = S[k].text;
+      if (transCache.has(t) || transPending.has(t) || batch.includes(t)) continue;
+      if (batch.length && chars + t.length > 1400) break;
+      batch.push(t);
+      chars += t.length;
+    }
+    if (!batch.length) return null;
+    const p = requestTranslation(batch).then(async (parts) => {
+      if (parts.length === batch.length) {
+        batch.forEach((t, k) => transCache.set(t, parts[k]));
+      } else {
+        for (const t of batch) transCache.set(t, (await requestTranslation([t])).join(' '));
+      }
+    }).finally(() => batch.forEach((t) => transPending.delete(t)));
+    batch.forEach((t) => transPending.set(t, p));
+    p.catch(() => {});
+    return p;
+  }
+
+  function showTranslation() {
+    const panel = $('#transPanel');
+    panel.hidden = !settings.translate || !doc || !doc.sentences.length;
+    if (panel.hidden) return;
+    const i = st.idx;
+    const S = doc.sentences;
+    const box = $('#transText');
+    const t = S[i].text;
+    if (transCache.has(t)) {
+      box.textContent = transCache.get(t);
+      box.classList.remove('muted');
+      const next = S[i + 1];
+      if (next && !transCache.has(next.text) && !transPending.has(next.text)) translateFrom(i + 1);
+      return;
+    }
+    box.textContent = '訳しています…';
+    box.classList.add('muted');
+    const p = transPending.get(t) || translateFrom(i);
+    if (!p) return;
+    p.then(() => { if (st.idx === i) showTranslation(); }).catch(() => {
+      if (st.idx !== i) return;
+      box.innerHTML = '訳を取得できませんでした。通信状態を確認してください。<button type="button" class="link-btn" data-retry>もう一度</button>';
+    });
+  }
+
+  function applyTranslate() {
+    $('#transBtn').setAttribute('aria-pressed', String(!!settings.translate));
+    showTranslation();
+  }
+
+  function toggleTranslate() {
+    settings.translate = !settings.translate;
+    saveSettings();
+    applyTranslate();
+    if (settings.translate && !store.get('transNoticed', false)) {
+      store.set('transNoticed', true);
+      toast('訳はGoogle翻訳で作ります。表示する文と、その先の数文だけが送信されます');
+    }
+  }
+
   // ---------------------------------------------------------------- sleep timer / wake lock
   function setSleep(min) {
     clearTimeout(st.sleepTimer);
@@ -1305,6 +1385,8 @@
     });
     window.addEventListener('popstate', () => { if (doc) closeDoc(); });
 
+    $('#transBtn').addEventListener('click', toggleTranslate);
+    $('#transPanel').addEventListener('click', (e) => { if (e.target.closest('[data-retry]')) showTranslation(); });
     $('#modeText').addEventListener('click', () => { settings.view = 'text'; saveSettings(); applyView(); });
     $('#modePdf').addEventListener('click', () => { settings.view = 'pdf'; saveSettings(); applyView(); });
 
@@ -1509,6 +1591,7 @@
       if (e.key === ' ') { e.preventDefault(); togglePlay(); }
       else if (e.key === 'ArrowLeft') { e.preventDefault(); if (e.shiftKey) skipSeconds(-10); else prevSentence(); }
       else if (e.key === 'ArrowRight') { e.preventDefault(); if (e.shiftKey) skipSeconds(10); else nextSentence(); }
+      else if (e.key === 't' || e.key === 'T') toggleTranslate();
     });
 
     document.addEventListener('visibilitychange', () => {
@@ -1531,6 +1614,7 @@
     applyPitch();
     applyRepeat();
     applySwitches();
+    applyTranslate();
     updateSleepUI();
     bind();
     if (synth) {
