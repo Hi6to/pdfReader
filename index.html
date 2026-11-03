@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>pdfReader</title>
+<meta name="description" content="英語のPDFを読み上げるブラウザ用リーダー">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="pdfReader">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#F5F6F3" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111416" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&display=swap">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="app.js" defer></script>
+</head>
+<body>
+
+<!-- 本棚(ホーム) -->
+<section id="home" class="view">
+  <header class="home-head">
+    <div class="brand">
+      <span class="brand-name">pdfReader</span>
+      <span class="brand-sub">英語のPDFを耳で読む</span>
+    </div>
+  </header>
+  <div class="home-body">
+    <div class="home-inner">
+      <label class="open-card" for="fileInput">
+        <svg class="open-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm7 1.5V9h5.5"/><path d="M8 13h8M8 17h5"/></svg>
+        <span class="open-text">
+          <span class="open-title">PDFを開く</span>
+          <span class="open-sub">ファイルを選ぶと文章を取り出して読み上げます</span>
+        </span>
+      </label>
+      <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden>
+
+      <h2 class="section-label">最近のPDF</h2>
+      <ul id="libraryList" class="library"></ul>
+      <p id="libraryEmpty" class="empty">まだありません。開いたPDFはこの端末のブラウザ内に保存され、次回は続きから再生できます。</p>
+
+      <details class="tips">
+        <summary>使い方のヒント</summary>
+        <ul>
+          <li>Safariの共有ボタン →「ホーム画面に追加」で、アプリのように全画面で使えます。</li>
+          <li>声は iPhone の「設定 › アクセシビリティ › 読み上げコンテンツ › 声 › 英語」で追加できます。高音質版をダウンロードすると、声の一覧に出てくる場合があります。</li>
+          <li>画面をロックすると読み上げが止まることがあります。読み上げ中は画面を消さない設定がおすすめです(設定はメニュー内)。</li>
+          <li>テキスト表示で文をタップすると、そこから読み上げます。長押しで単語を選べば、iPhone標準の「調べる」「翻訳」が使えます。</li>
+        </ul>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- リーダー -->
+<section id="reader" class="view" hidden>
+  <header class="topbar">
+    <button id="backBtn" class="icon-btn" type="button" aria-label="本棚に戻る">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path class="stroke" d="M15 5l-7 7 7 7"/></svg>
+    </button>
+    <div class="doc-title-wrap">
+      <div id="docTitle" class="doc-title"></div>
+      <div id="sleepBadge" class="sleep-badge" hidden></div>
+    </div>
+    <div class="seg" role="group" aria-label="表示の切り替え">
+      <button type="button" id="modeText" data-mode="text" aria-pressed="true">テキスト</button>
+      <button type="button" id="modePdf" data-mode="pdf" aria-pressed="false">PDF</button>
+    </div>
+  </header>
+
+  <div id="pdfToolbar" class="pdf-toolbar" hidden>
+    <button id="pdfPrev" class="icon-btn sm" type="button" aria-label="前のページ">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path class="stroke" d="M15 5l-7 7 7 7"/></svg>
+    </button>
+    <label class="page-field">
+      <input id="pdfPageInput" type="number" inputmode="numeric" min="1" value="1" aria-label="ページ番号">
+      <span>/ <span id="pdfPageCount">1</span></span>
+    </label>
+    <button id="pdfNext" class="icon-btn sm" type="button" aria-label="次のページ">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path class="stroke" d="M9 5l7 7-7 7"/></svg>
+    </button>
+    <span class="tb-spacer"></span>
+    <button id="pdfReadPage" class="chip sm" type="button" aria-label="このページの最初から読む">ここから読む</button>
+    <button id="zoomOut" class="icon-btn sm" type="button" aria-label="縮小">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path class="stroke" d="M6 12h12"/></svg>
+    </button>
+    <button id="zoomIn" class="icon-btn sm" type="button" aria-label="拡大">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path class="stroke" d="M6 12h12M12 6v12"/></svg>
+    </button>
+  </div>
+
+  <div class="stage-wrap">
+    <main id="stage" class="stage">
+      <div id="textView" class="text-view"></div>
+      <div id="pdfView" class="pdf-view" hidden>
+        <div id="pdfPage" class="pdf-page">
+          <canvas id="pdfCanvas"></canvas>
+          <div id="hlLayer" class="hl-layer"></div>
+        </div>
+        <p class="pdf-hint">ページ上の文をタップすると、そこから読み上げます</p>
+      </div>
+    </main>
+    <button id="followBtn" class="follow-btn" type="button" hidden>読んでいる位置へ</button>
+  </div>
+
+  <footer class="player">
+    <div class="seek-row">
+      <span id="posLabel" class="pos-label">p.1 / 1</span>
+      <span id="remainLabel" class="remain-label"></span>
+    </div>
+    <input id="seek" class="seek" type="range" min="0" max="0" value="0" step="1" aria-label="読み上げ位置">
+    <div class="transport">
+      <button id="back10" class="tbtn" type="button" aria-label="約10秒戻る">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V1.5L7 6l5 4.5V7a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8z"/><text x="12" y="16.2" text-anchor="middle">10</text></svg>
+      </button>
+      <button id="prevSent" class="tbtn" type="button" aria-label="前の文">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h2.2v12H6zM9.6 12 18 18V6z"/></svg>
+      </button>
+      <button id="playBtn" class="play-btn" type="button" aria-label="再生">
+        <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.2v13.6L19 12z"/></svg>
+        <svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 5h4v14h-4zM13.5 5h4v14h-4z"/></svg>
+      </button>
+      <button id="nextSent" class="tbtn" type="button" aria-label="次の文">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 6H18v12h-2.2zM6 18l8.4-6L6 6z"/></svg>
+      </button>
+      <button id="fwd10" class="tbtn" type="button" aria-label="約10秒進む">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><g transform="matrix(-1 0 0 1 24 0)"><path d="M12 5V1.5L7 6l5 4.5V7a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8z"/></g><text x="12" y="16.2" text-anchor="middle">10</text></svg>
+      </button>
+    </div>
+    <div class="quick-row">
+      <button id="speedChip" class="chip" type="button" aria-label="読み上げの速さ"><b id="speedLabel">1.0×</b></button>
+      <button id="voiceChip" class="chip voice-chip" type="button" aria-label="声を選ぶ">声 <b id="voiceLabel">—</b></button>
+      <button id="repeatChip" class="chip" type="button" aria-pressed="false" aria-label="1文リピート">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z"/></svg>1文
+      </button>
+      <button id="menuBtn" class="chip" type="button" aria-label="その他のメニュー">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
+      </button>
+    </div>
+  </footer>
+</section>
+
+<!-- シート共通の背景 -->
+<div id="backdrop" class="backdrop" hidden></div>
+
+<!-- 速度 -->
+<div id="speedSheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="speedTitle" hidden>
+  <div class="sheet-head"><h3 id="speedTitle">読み上げの速さ</h3><button class="icon-btn sm close" type="button" data-close aria-label="閉じる"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="stroke" d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+  <div class="big-value"><span id="rateValue">1.00</span><small>×</small></div>
+  <input id="rateRange" type="range" min="0.5" max="2" step="0.05" value="1" aria-label="速度">
+  <div class="presets" id="ratePresets">
+    <button type="button" data-rate="0.6">0.6</button>
+    <button type="button" data-rate="0.75">0.75</button>
+    <button type="button" data-rate="0.9">0.9</button>
+    <button type="button" data-rate="1">1.0</button>
+    <button type="button" data-rate="1.1">1.1</button>
+    <button type="button" data-rate="1.25">1.25</button>
+    <button type="button" data-rate="1.5">1.5</button>
+    <button type="button" data-rate="1.75">1.75</button>
+  </div>
+  <div class="field">
+    <div class="field-head"><label for="gapRange">文と文の間の無音</label><span id="gapValue">0秒</span></div>
+    <input id="gapRange" type="range" min="0" max="3" step="0.25" value="0">
+    <p class="note">シャドーイングやリピーティングの練習に。1文リピートと組み合わせると便利です。</p>
+  </div>
+</div>
+
+<!-- 声 -->
+<div id="voiceSheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="voiceTitle" hidden>
+  <div class="sheet-head"><h3 id="voiceTitle">声</h3><button class="icon-btn sm close" type="button" data-close aria-label="閉じる"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="stroke" d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+  <div class="field">
+    <div class="field-head"><label for="pitchRange">声の高さ</label><span id="pitchValue">1.05</span></div>
+    <input id="pitchRange" type="range" min="0.8" max="1.4" step="0.05" value="1.05">
+  </div>
+  <div id="voiceList" class="voice-list" role="radiogroup" aria-label="声の一覧"></div>
+  <p class="note">タップすると試し読みします。声を増やすには、iPhoneの「設定 › アクセシビリティ › 読み上げコンテンツ › 声 › 英語」から追加してください。</p>
+</div>
+
+<!-- その他 -->
+<div id="menuSheet" class="sheet" role="dialog" aria-modal="true" aria-label="メニュー" hidden>
+  <div class="sheet-head">
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" data-tab="move" aria-selected="true">移動・検索</button>
+      <button type="button" role="tab" data-tab="marks" aria-selected="false">しおり</button>
+      <button type="button" role="tab" data-tab="prefs" aria-selected="false">設定</button>
+    </div>
+    <button class="icon-btn sm close" type="button" data-close aria-label="閉じる"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="stroke" d="M6 6l12 12M18 6 6 18"/></svg></button>
+  </div>
+
+  <div class="tab-panel" data-panel="move">
+    <form id="pageJumpForm" class="inline-form">
+      <label for="pageJumpInput">ページへ移動</label>
+      <input id="pageJumpInput" type="number" inputmode="numeric" min="1" placeholder="12">
+      <button type="submit" class="chip">移動</button>
+    </form>
+    <form id="searchForm" class="inline-form">
+      <label for="searchInput" class="visually-hidden">本文を検索</label>
+      <input id="searchInput" type="search" placeholder="本文を検索(英単語・フレーズ)" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button type="submit" class="chip">検索</button>
+    </form>
+    <ul id="searchResults" class="results"></ul>
+  </div>
+
+  <div class="tab-panel" data-panel="marks" hidden>
+    <button id="addMark" type="button" class="wide-btn">いま読んでいる文にしおりを挟む</button>
+    <ul id="markList" class="results"></ul>
+    <p id="markEmpty" class="empty">しおりはまだありません。</p>
+  </div>
+
+  <div class="tab-panel" data-panel="prefs" hidden>
+    <h4 class="group-label">スリープタイマー</h4>
+    <div class="presets" id="sleepPresets">
+      <button type="button" data-min="0">オフ</button>
+      <button type="button" data-min="10">10分</button>
+      <button type="button" data-min="20">20分</button>
+      <button type="button" data-min="30">30分</button>
+      <button type="button" data-min="60">60分</button>
+    </div>
+    <p id="sleepStatus" class="note"></p>
+
+    <h4 class="group-label">表示</h4>
+    <div class="row">
+      <span>文字の大きさ</span>
+      <span class="stepper">
+        <button type="button" id="fontDown" aria-label="文字を小さく">A−</button>
+        <span id="fontValue">19</span>
+        <button type="button" id="fontUp" aria-label="文字を大きく">A+</button>
+      </span>
+    </div>
+    <div class="row">
+      <span>書体</span>
+      <span class="seg small" id="fontSeg">
+        <button type="button" data-font="serif" aria-pressed="true">Serif</button>
+        <button type="button" data-font="sans" aria-pressed="false">Sans</button>
+      </span>
+    </div>
+    <div class="row">
+      <span>テーマ</span>
+      <span class="seg small" id="themeSeg">
+        <button type="button" data-theme-opt="auto" aria-pressed="true">自動</button>
+        <button type="button" data-theme-opt="light" aria-pressed="false">ライト</button>
+        <button type="button" data-theme-opt="dark" aria-pressed="false">ダーク</button>
+      </span>
+    </div>
+    <label class="row" for="optWord"><span>読んでいる単語もハイライト</span><input type="checkbox" class="switch" id="optWord"></label>
+
+    <h4 class="group-label">読み上げ</h4>
+    <label class="row" for="optHeaders"><span>ヘッダーやページ番号を読まない</span><input type="checkbox" class="switch" id="optHeaders"></label>
+    <label class="row" for="optCites"><span>引用番号 [12] やURLを読まない</span><input type="checkbox" class="switch" id="optCites"></label>
+    <label class="row" for="optWake"><span>読み上げ中は画面を消さない</span><input type="checkbox" class="switch" id="optWake"></label>
+
+    <h4 class="group-label">操作のヒント</h4>
+    <ul class="help">
+      <li><b>前の文</b>:文の途中なら文頭へ、文頭なら1つ前の文へ戻ります。</li>
+      <li><b>10秒戻る/進む</b>:文字数から計算したおおよその時間です。</li>
+      <li>キーボード:スペースで再生/停止、← → で文単位、Shift+← → で10秒。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- 読み込み中 -->
+<div id="loading" class="loading" hidden>
+  <div class="load-card">
+    <div id="loadMsg">PDFを読み込んでいます…</div>
+    <div class="load-bar"><span id="loadBar"></span></div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+</body>
+</html>
