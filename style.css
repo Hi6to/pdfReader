@@ -746,3 +746,9 @@ input[type="range"]::-moz-range-thumb {
 .key-foot { display: flex; align-items: flex-start; gap: 8px; }
 .key-foot .note { flex: 1; min-width: 0; }
 .key-foot .chip { margin-top: 6px; flex: none; }
+
+/* リピートの切り替え(オフ / 1文 / ページ) */
+.repeat-chip .i-repeat-one { display: none; }
+.repeat-chip[data-mode="sentence"] .i-repeat-one { display: block; }
+.repeat-chip[data-mode="sentence"] .i-repeat { display: none; }
+.repeat-chip #repeatLabel:empty { display: none; }

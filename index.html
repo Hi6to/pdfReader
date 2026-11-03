@@ -146,8 +146,10 @@
     <div class="quick-row">
       <button id="speedChip" class="chip" type="button" aria-label="読み上げの速さ"><b id="speedLabel">1.0×</b></button>
       <button id="voiceChip" class="chip voice-chip" type="button" aria-label="声を選ぶ"><svg class="i-cloud" viewBox="0 0 24 24" aria-hidden="true"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.994 5.994 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg><span class="voice-kind">声</span> <b id="voiceLabel">—</b></button>
-      <button id="repeatChip" class="chip" type="button" aria-pressed="false" aria-label="1文リピート">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z"/></svg>1文
+      <button id="repeatChip" class="chip repeat-chip" type="button" aria-pressed="false" aria-label="リピート: オフ">
+        <svg class="i-repeat" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
+        <svg class="i-repeat-one" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z"/></svg>
+        <span id="repeatLabel"></span>
       </button>
       <button id="menuBtn" class="chip" type="button" aria-label="その他のメニュー">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
@@ -177,7 +179,7 @@
   <div class="field">
     <div class="field-head"><label for="gapRange">文と文の間の無音</label><span id="gapValue">0秒</span></div>
     <input id="gapRange" type="range" min="0" max="3" step="0.25" value="0">
-    <p class="note">シャドーイングやリピーティングの練習に。1文リピートと組み合わせると便利です。</p>
+    <p class="note">シャドーイングやリピーティングの練習に。リピート(1文・ページ)と組み合わせると便利です。</p>
   </div>
 </div>
 
@@ -236,7 +238,7 @@
 
     <ul class="help">
       <li>声は Google の Chirp 3 HD です。毎月100万文字まで無料で、空白も1文字に数えます。</li>
-      <li>一度読んだ文の音声は端末に保存して使い回すので、巻き戻しや読み直しでは使用量は増えません。速度を変えても増えません。</li>
+      <li>段落ごとにまとめて音声を作るので、文と文のつながりが自然になります。作った音声は端末に保存して使い回すので、巻き戻しや読み直し、速度の変更では使用量は増えません。</li>
       <li>使用量はこの端末で数えた値です。ほかの端末でも同じキーを使うなら、Google Cloud の「お支払い」画面でも確認してください。</li>
       <li>画面をロックしても読み上げが続きやすく、ロック画面から一時停止や文の移動もできます。</li>
     </ul>
@@ -333,7 +335,9 @@
     <h4 class="group-label">操作のヒント</h4>
     <ul class="help">
       <li><b>前の文</b>:文の途中なら文頭へ、文頭なら1つ前の文へ戻ります。</li>
-      <li><b>10秒戻る/進む</b>:文字数から計算したおおよその時間です。</li>
+      <li><b>10秒戻る/進む</b>:文字数から計算したおおよその時間です(クラウドの声では正確な時間)。</li>
+      <li><b>リピート</b>:押すたびに「1文」→「ページ」→「オフ」と切り替わります。「ページ」では、いま読んでいるページの最後まで読んだら、そのページの最初に戻ります。</li>
+      <li><b>読み方</b>:「e.g.」は「for example」、「Fig. 3」は「Figure 3」、「10–20」は「10 to 20」のように、声に出すときの言い方で読みます(画面の文はそのまま)。</li>
       <li><b>訳</b>:画面上の「訳」ボタンで、読んでいる文の日本語訳を表示します。表示する文とその先の数文だけがGoogle翻訳に送られます。</li>
       <li>キーボード:スペースで再生/停止、← → で文単位、Shift+← → で10秒、T で訳の表示。</li>
     </ul>

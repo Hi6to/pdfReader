@@ -47,6 +47,8 @@
   const storedSettings = store.get('settings', {});
   // v1の初期値だった声の高さ1.05は、声が不自然になるので1.0に戻す
   if (!storedSettings.v && storedSettings.pitch === 1.05) storedSettings.pitch = 1;
+  // リピートは false / 'sentence'(1文)/ 'page'(ページ)。以前は true/false だった
+  if (storedSettings.repeat === true) storedSettings.repeat = 'sentence';
   const settings = Object.assign({}, DEFAULTS, storedSettings, { v: DEFAULTS.v });
   const saveSettings = () => store.set('settings', settings);
   // APIキーはブラウザに保存しない。以前の版で保存したキーが残っていれば消す
@@ -149,7 +151,7 @@
     userScrollAt: 0, seeking: false, seekAt: 0,
     pdfPage: 1, pdfFollow: true, zoom: 1, pdfScale: 1, renderTok: 0, renderTask: null,
     sleepAt: 0, sleepMin: 0, sleepTimer: 0, sleepTick: 0, sleepPending: false,
-    audioIdx: -1, cloudError: false, unlock: null,
+    chunk: null, boundaryTimer: 0, cloudError: false, unlock: null, // chunk = いま読み込んでいるクラウドの声の音声(段落単位)
   };
 
   // ---------------------------------------------------------------- text extraction
@@ -429,7 +431,10 @@
     if (opt.skipCites) {
       t = t.replace(/\s?\[\d+(?:\s*[-–,]\s*\d+)*\]/g, '')
         .replace(/\b(?:https?:\/\/|www\.)[^\s)\]]+/gi, 'link')
-        .replace(/\bdoi:\s*\S+/gi, '');
+        .replace(/\bdoi:\s*\S+/gi, '')
+        // 著者と年の引用「(Smith et al., 2020; Lee and Kim, 2019)」と、「Smith et al. (2020)」の年
+        .replace(AUTHOR_YEAR_CITE, '')
+        .replace(NARRATIVE_CITE_YEAR, '');
     }
     t = t.replace(/\s+/g, ' ').trim();
     if (opt.skipMath) t = stripInlineMath(t);
@@ -463,13 +468,14 @@
     return /^[A-Za-z]{1,2}\d*$/.test(core) && !SHORT_WORDS.has(core.toLowerCase());
   }
 
-  // 文の中の数式(「where x ∈ R^d is」の「x ∈ R^d」など)を取り除く
+  // 文の中の数式(「where x ∈ R^d is」の「x ∈ R^d」など)を取り除く。「~10」(およそ10)は数式にしない
+  const isMathToken = (w) => MATH_CHAR.test(w) && !/^\(?~\d/.test(w);
   function stripInlineMath(t) {
     if (!MATH_CHAR.test(t)) return t;
     const toks = t.split(' ');
-    const drop = toks.map((w) => MATH_CHAR.test(w));
+    const drop = toks.map(isMathToken);
     toks.forEach((w, k) => {
-      if (!MATH_CHAR.test(w)) return;
+      if (!isMathToken(w)) return;
       for (let j = k - 1; j >= 0 && !drop[j] && isVarToken(toks[j]); j--) drop[j] = true;
       for (let j = k + 1; j < toks.length && !drop[j] && isVarToken(toks[j]); j++) drop[j] = true;
     });
@@ -484,6 +490,93 @@
       k = e;
     }
     return out.join(' ');
+  }
+
+  const CITE_NAME = "[A-Z][\\p{L}'’.\\-]*(?:\\s+(?:et\\s+al\\.?|and|&|[A-Z][\\p{L}'’\\-]*))*";
+  const CITE_YEAR = '(?:19|20)\\d{2}[a-z]?(?:,\\s*(?:19|20)\\d{2}[a-z]?)*';
+  const AUTHOR_YEAR_CITE = new RegExp(`\\s?\\((?:(?:see|e\\.g\\.,?|cf\\.)\\s+)?(?:${CITE_NAME},?\\s+${CITE_YEAR}(?:,\\s*pp?\\.\\s*\\d+(?:[–-]\\d+)?)?(?:;\\s*)?)+\\)`, 'gu');
+  const NARRATIVE_CITE_YEAR = new RegExp(`(?<=(?:et\\s+al\\.?|\\b[A-Z][\\p{Ll}'’\\-]+))\\s?\\(${CITE_YEAR}\\)`, 'gu');
+
+  // ---------------------------------------------------------------- speech text
+  // 声に出して読むときの言い換え。ネイティブが読み上げるときと同じように、略語や記号を言葉にする。
+  // 画面の文はそのままにして、読み上げ用の文と「読み上げ用の位置 → 画面の位置」の対応表を作る
+  const SPEECH_RULES = [
+    [/\be\.g\.(,?)/gi, 'for example$1'],
+    [/\bi\.e\.(,?)/gi, 'that is$1'],
+    [/\bet al\.(?!$)/g, 'et al'],
+    [/\bvs?\.(?=\s)/g, 'versus'],
+    [/\bFigs\.(?=\s*\d)/g, 'Figures'],
+    [/\bFig\.(?=\s*\d)/g, 'Figure'],
+    [/\bEqs\.(?=\s*\(?\d)/g, 'Equations'],
+    [/\bEq\.(?=\s*\(?\d)/g, 'Equation'],
+    [/\bSecs\.(?=\s*\d)/g, 'Sections'],
+    [/\bSec(?:t)?\.(?=\s*\d)/g, 'Section'],
+    [/\bCh(?:ap)?\.(?=\s*\d)/g, 'Chapter'],
+    [/\bTab\.(?=\s*\d)/g, 'Table'],
+    [/\bRefs\.(?=\s*\d)/g, 'References'],
+    [/\bRef\.(?=\s*\d)/g, 'Reference'],
+    [/\bNos\.(?=\s*\d)/g, 'Numbers'],
+    [/\bNo\.(?=\s*\d)/g, 'Number'],
+    [/\bpp\.(?=\s*\d)/g, 'pages'],
+    [/\bp\.(?=\s*\d)/g, 'page'],
+    [/\bVols?\.(?=\s*\d)/g, 'Volume'],
+    [/\bapprox\.(?=\s)/gi, 'approximately'],
+    [/\bcf\.(?=\s)/g, 'compare'],
+    [/\bw\.r\.t\.?/g, 'with respect to'],
+    [/\bresp\.(?=[\s),;])/g, 'respectively'],
+    [/\bviz\.(?=\s)/g, 'namely'],
+    // 数の範囲「12–15」「2019-2021」(小数や「2020-01-15」のような日付は除く。文末のピリオドは可)
+    [/(?<![\d.])(\d{1,4})\s?[–—]\s?(\d{1,4})(?!\d|[.,]\d)/g, '$1 to $2'],
+    [/(?<![\d.\-])(\d{1,4})-(\d{1,4})(?!\d|[.,]\d|-\d)/g, '$1 to $2'],
+    [/~\s?(?=\d)/g, 'about '],
+  ];
+  // 全部大文字の見出しで、ふつうの書き方に直す短い単語(それ以外の4文字以下は略語として残す)
+  const CAPS_COMMON = new Set('A AN THE AND OR OF TO IN ON AT BY FOR WITH FROM INTO ONTO OVER AS IS ARE WAS BE NOT NO ITS IT THIS THAT WE YOU OUR HOW WHY WHAT WHEN ONE TWO SIX TEN PART'.split(' '));
+
+  function speechText(src) {
+    const hits = [];
+    for (const [re, rep] of SPEECH_RULES) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(src))) {
+        if (!m[0].length) { re.lastIndex++; continue; }
+        hits.push({ a: m.index, b: m.index + m[0].length, out: rep.replace(/\$(\d)/g, (_, d) => m[+d] || '') });
+      }
+    }
+    hits.sort((x, y) => x.a - y.a || y.b - x.b);
+    let text = '';
+    const map = [];
+    let pos = 0;
+    for (const h of hits) {
+      if (h.a < pos) continue; // 重なったら先のものを使う
+      text += src.slice(pos, h.a);
+      for (let k = pos; k < h.a; k++) map.push(k);
+      text += h.out;
+      for (let k = 0; k < h.out.length; k++) map.push(h.a);
+      pos = h.b;
+    }
+    text += src.slice(pos);
+    for (let k = pos; k < src.length; k++) map.push(k);
+    map.push(src.length);
+    // 全部大文字の見出しは、ふつうの書き方にする(頭文字を1文字ずつ読まれないように。文字数は変わらない)。
+    // 4文字以下でよくある単語でないもの(NLP、BERTなど)は略語として残す
+    if (!/[a-z]/.test(text) && (text.match(/[A-Z]/g) || []).length >= 8) {
+      text = text.replace(/\b[A-Z][A-Z]+\b/g, (w) => (w.length >= 5 || CAPS_COMMON.has(w) ? w[0] + w.slice(1).toLowerCase() : w));
+    }
+    return { text, map: Int32Array.from(map) };
+  }
+
+  const sayOf = (s) => s.say || (s.say = speechText(s.text));
+
+  // 画面の文の位置 → 読み上げ用の文の位置(その位置以降で最初に対応する所)
+  function spokenIndex(map, offset) {
+    let lo = 0;
+    let hi = map.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (map[mid] < offset) lo = mid + 1; else hi = mid;
+    }
+    return Math.min(lo, map.length - 1);
   }
 
   // items は start 順。pos を含む(または pos 以降で最初の)項目の位置を返す
@@ -1038,7 +1131,16 @@
     clearTimeout(st.gapTimer);
     clearTimeout(st.speakTimer);
     clearTimeout(st.watchdog);
-    st.gapTimer = st.speakTimer = st.watchdog = 0;
+    clearTimeout(st.boundaryTimer);
+    st.gapTimer = st.speakTimer = st.watchdog = st.boundaryTimer = 0;
+  }
+
+  // i番目の文と同じページの最初の文(文はページ順に並んでいる)
+  function firstOfPage(i) {
+    const S = doc.sentences;
+    let k = i;
+    while (k > 0 && S[k - 1].page === S[i].page) k--;
+    return k;
   }
 
   function play() {
@@ -1055,10 +1157,10 @@
     acquireWakeLock();
     if (cloudActive()) {
       unlockAudio(); // iOSではタップ操作の中で一度再生しておかないと、あとから音声を流せない
-      // 一時停止した文の音声が残っていれば、止めた位置からそのまま再開する
-      if (st.audioIdx === st.idx && audioEl.currentTime > 0 && !audioEl.ended) {
+      // 一時停止した音声が残っていれば、止めた位置からそのまま再開する
+      if (cloudCanResume()) {
         audioEl.playbackRate = settings.rate;
-        audioEl.play().catch(() => { pause(); });
+        audioEl.play().then(() => { st.uttStart = performance.now(); scheduleBoundary(); }).catch(() => { pause(); });
         return;
       }
     }
@@ -1099,16 +1201,20 @@
     savePosSoon();
 
     const s = S[st.idx];
-    let text = s.text.slice(offset);
+    const first = sayOf(s); // 読み上げ用に言い換えた文(e.g. → for example など)
+    const startAt = spokenIndex(first.map, offset);
+    let text = first.text.slice(startAt);
     if (!text.trim()) { onSentenceEnd(gen); return; }
 
     // 単語位置の通知(boundary)が使える声なら、同じ段落の続きの文もつなげて1回で読む。
     // 文ごとに区切って読むと、文の間に不自然な間が入るため。どの文を読んでいるかは通知の位置から求める
-    const parts = [{ k: st.idx, at: 0, base: offset }];
-    if (st.boundaryOK === true && !settings.repeat && !settings.gap) {
-      for (let k = st.idx + 1; k < S.length && S[k].para === s.para && text.length + S[k].text.length < MAX_UTTERANCE; k++) {
-        parts.push({ k, at: text.length + 1, base: 0 });
-        text += ' ' + S[k].text;
+    const parts = [{ k: st.idx, at: 0, base: startAt, say: first }];
+    if (st.boundaryOK === true && settings.repeat !== 'sentence' && !settings.gap) {
+      for (let k = st.idx + 1; k < S.length && S[k].para === s.para && (settings.repeat !== 'page' || S[k].page === s.page); k++) {
+        const say = sayOf(S[k]);
+        if (text.length + say.text.length >= MAX_UTTERANCE) break;
+        parts.push({ k, at: text.length + 1, base: 0, say });
+        text += ' ' + say.text;
       }
     }
     let sawBoundary = false;
@@ -1134,8 +1240,13 @@
         enterSentence(parts[p].k);
         if (gen !== st.gen) return; // スリープタイマーで止まった
       }
-      st.wordPos = parts[p].base + (e.charIndex - parts[p].at);
-      markWord(st.wordPos, e.charLength);
+      // 通知は読み上げ用の文での位置なので、画面の文での位置に直す
+      const part = parts[p];
+      const sp = clamp(part.base + (e.charIndex - part.at), 0, part.say.text.length);
+      const pos = part.say.map[sp];
+      const end = e.charLength ? part.say.map[Math.min(part.say.text.length, sp + e.charLength)] : 0;
+      st.wordPos = pos;
+      markWord(pos, end > pos ? end - pos : 0);
     };
     u.onend = () => {
       if (gen !== st.gen) return;
@@ -1184,10 +1295,18 @@
   function onSentenceEnd(gen) {
     if (gen !== st.gen || !st.playing) return;
     if (st.sleepPending) { finishSleep(); return; }
+    const S = doc.sentences;
     let next = st.idx;
-    if (!settings.repeat) {
+    let delay = settings.gap * 1000;
+    if (settings.repeat === 'sentence') {
+      delay = Math.max(delay, 400);
+    } else {
       next = st.idx + 1;
-      if (next >= doc.sentences.length) {
+      if (settings.repeat === 'page' && (next >= S.length || S[next].page !== S[st.idx].page)) {
+        // ページの終わりまで来たら、同じページの最初に戻る
+        next = firstOfPage(st.idx);
+        delay = Math.max(delay, 800);
+      } else if (next >= S.length) {
         pause();
         st.offset = st.wordPos = 0;
         toast('最後まで読み終わりました');
@@ -1196,8 +1315,6 @@
     }
     st.idx = next;
     st.offset = st.wordPos = 0;
-    let delay = settings.gap * 1000;
-    if (settings.repeat) delay = Math.max(delay, 400);
     if (delay > 0) {
       markCurrent();
       st.gapTimer = setTimeout(() => { if (gen === st.gen && st.playing) speakFrom(next, 0); }, delay);
@@ -1225,15 +1342,16 @@
   let restartTimer = 0;
   function restartSoon() {
     clearTimeout(restartTimer);
-    // クラウドの声は文ごとの音声なので、速度は再生速度を変えるだけでよい(作り直さないので使用量も増えない)
-    if (cloudActive()) { audioEl.playbackRate = settings.rate; return; }
+    // クラウドの声は速度を再生速度で変えるだけでよい(作り直さないので使用量も増えない)。
+    // リピートや文間の無音は、次の文の区切りで反映される
+    if (cloudActive()) { audioEl.playbackRate = settings.rate; scheduleBoundary(); return; }
     if (!st.playing) return;
     restartTimer = setTimeout(() => { if (st.playing) speakFrom(st.idx, st.wordPos); }, 250);
   }
 
   const durOf = (i) => doc.sentences[i].text.length / (CPS * settings.rate) + 0.25;
   function elapsedInCurrent() {
-    if (cloudActive() && st.audioIdx === st.idx) return audioEl.currentTime / settings.rate;
+    if (cloudActive() && cloudLoaded()) return Math.max(0, audioEl.currentTime - st.chunk.bounds[st.idx - st.chunk.k0]) / settings.rate;
     let t = st.offset / (CPS * settings.rate);
     if (st.playing && st.started) t += (performance.now() - st.uttStart) / 1000;
     return Math.min(t, durOf(st.idx));
@@ -1241,10 +1359,11 @@
 
   function skipSeconds(sec) {
     if (!doc || !doc.sentences.length) return;
-    // クラウドの声で、移動先がいまの文の音声の中なら、その中で正確に移動する
-    if (cloudActive() && st.audioIdx === st.idx && audioEl.duration) {
+    // クラウドの声で、移動先がいまの段落の音声の中なら、その中で正確に移動する
+    if (cloudActive() && cloudLoaded() && audioEl.duration) {
       const target = audioEl.currentTime + sec * settings.rate;
-      if (target >= 0 && target < audioEl.duration - 0.3) { audioEl.currentTime = target; return; }
+      if (target >= 0 && target < audioEl.duration - 0.2) { audioEl.currentTime = target; cloudSyncIdx(); return; }
+      if (target >= audioEl.duration - 0.2) { jumpTo(st.chunk.k1 + 1); return; }
     }
     const n = doc.sentences.length;
     let i = st.idx;
@@ -1405,6 +1524,169 @@
     st.unlock = audioEl.play().catch(() => {});
   }
 
+  // ---- 段落単位の音声
+  // 1文ずつ音声を作ると、文ごとに抑揚がリセットされて、つながりが不自然になる。
+  // そこで段落を(長ければ文の区切りで)まとめて1つの音声にし、音声の中の無音の位置から
+  // 文の区切りの時刻を求めて、ハイライトや文単位の移動に使う
+  const CHUNK_CHARS = 900; // 1つの音声にまとめる目安の文字数(1分ほど)
+  const chunkMemo = new Map(); // 保存キー → { url, bounds }
+  const chunkPending = new Map();
+
+  // i番目の文を含むまとまり。区切りは文書だけで決まるので、どこから読み始めても同じ音声を使い回せる
+  function chunkRange(i) {
+    const S = doc.sentences;
+    const p = S[i].para;
+    const ps = doc.paraStarts[p];
+    const pe = (p + 1 < doc.paraStarts.length ? doc.paraStarts[p + 1] : S.length) - 1;
+    let k0 = ps;
+    let len = 0;
+    for (let k = ps; k <= pe; k++) {
+      const n = sayOf(S[k]).text.length + 1;
+      if (k > k0 && len + n > CHUNK_CHARS) {
+        if (i < k) return { k0, k1: k - 1 };
+        k0 = k;
+        len = 0;
+      }
+      len += n;
+    }
+    return { k0, k1: pe };
+  }
+
+  async function getChunk(i, voice = settings.cloudVoice) {
+    const { k0, k1 } = chunkRange(i);
+    const says = [];
+    for (let k = k0; k <= k1; k++) says.push(sayOf(doc.sentences[k]).text);
+    const text = says.join(' ');
+    const key = voice + '|' + text;
+    let memo = chunkMemo.get(key);
+    if (!memo) {
+      if (!chunkPending.has(key)) {
+        const p = (async () => {
+          let blob = await library.audioGet(key).catch(() => null);
+          if (!blob) {
+            blob = await synthesize(text, voice);
+            library.audioPut(key, blob).catch(() => {});
+          }
+          const m = { url: URL.createObjectURL(blob), bounds: await sentenceBounds(blob, says) };
+          chunkMemo.set(key, m);
+          if (chunkMemo.size > 40) {
+            const [oldKey, old] = chunkMemo.entries().next().value;
+            if (audioEl.src !== old.url) URL.revokeObjectURL(old.url);
+            chunkMemo.delete(oldKey);
+          }
+          return m;
+        })().finally(() => chunkPending.delete(key));
+        chunkPending.set(key, p);
+      }
+      memo = await chunkPending.get(key);
+    }
+    return { k0, k1, key, voice, says, url: memo.url, bounds: memo.bounds, memo };
+  }
+
+  // 文字数の比率だけで見積もった区切り(音声を解析できなかったとき)
+  function proportionalBounds(duration, says) {
+    const total = says.reduce((a, t) => a + t.length + 1, 0);
+    const bounds = [0];
+    let acc = 0;
+    for (let j = 1; j < says.length; j++) {
+      acc += says[j - 1].length + 1;
+      bounds.push(duration * acc / total);
+    }
+    bounds.push(duration);
+    return bounds;
+  }
+
+  // 音声の音量を10msごとに調べて無音の区間を探し、文字数の比率で見積もった位置の近くにある
+  // いちばん長い無音を文の区切りとする。bounds[j] = j番目の文の始まりの時刻、最後は音声の長さ
+  async function sentenceBounds(blob, says) {
+    let data;
+    try {
+      const Ctx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+      const ctx = new Ctx(1, 1, 16000);
+      const buf = await blob.arrayBuffer();
+      data = await new Promise((resolve, reject) => {
+        const p = ctx.decodeAudioData(buf, resolve, reject);
+        if (p && p.then) p.then(resolve, reject);
+      });
+    } catch {
+      return null;
+    }
+    const duration = data.duration;
+    if (says.length < 2) return [0, duration];
+    const pcm = data.getChannelData(0);
+    const hop = Math.max(1, Math.round(data.sampleRate * 0.01));
+    const n = Math.floor(pcm.length / hop);
+    const env = new Float32Array(n);
+    let peak = 0;
+    for (let f = 0; f < n; f++) {
+      let sum = 0;
+      for (let k = f * hop, e = k + hop; k < e; k++) sum += pcm[k] * pcm[k];
+      env[f] = Math.sqrt(sum / hop);
+      if (env[f] > peak) peak = env[f];
+    }
+    if (!peak) return proportionalBounds(duration, says);
+    const th = peak * 0.06;
+    let first = 0;
+    while (first < n && env[first] < th) first++;
+    let last = n - 1;
+    while (last > first && env[last] < th) last--;
+    const gaps = [];
+    let s0 = -1;
+    for (let f = first; f <= last; f++) {
+      if (env[f] < th) { if (s0 < 0) s0 = f; }
+      else if (s0 >= 0) {
+        if (f - s0 >= 8) gaps.push({ mid: (s0 + f) / 200, len: (f - s0) / 100 });
+        s0 = -1;
+      }
+    }
+    const t0 = first / 100;
+    const t1 = (last + 1) / 100;
+    const total = says.reduce((a, t) => a + t.length + 1, 0);
+    const bounds = [0];
+    let acc = 0;
+    let prev = t0;
+    for (let j = 1; j < says.length; j++) {
+      acc += says[j - 1].length + 1;
+      const est = t0 + (t1 - t0) * acc / total;
+      const win = Math.max(0.8, (t1 - t0) * 0.12);
+      let best = null;
+      let score = -Infinity;
+      for (const g of gaps) {
+        if (g.mid <= prev + 0.25 || Math.abs(g.mid - est) > win) continue;
+        const sc = g.len * 2 - Math.abs(g.mid - est); // 長い無音(文末の間)を優先する
+        if (sc > score) { score = sc; best = g; }
+      }
+      const b = best ? best.mid : Math.max(est, prev + 0.25);
+      bounds.push(b);
+      prev = b;
+    }
+    bounds.push(duration);
+    return bounds;
+  }
+
+  const boundsIndex = (bounds, t) => {
+    let j = bounds.length - 2;
+    while (j > 0 && bounds[j] > t + 0.02) j--;
+    return j;
+  };
+  // いまの文を含む音声が読み込まれているか
+  const cloudLoaded = () => {
+    const c = st.chunk;
+    return !!c && !!c.bounds && audioEl.src === c.url && c.voice === settings.cloudVoice && st.idx >= c.k0 && st.idx <= c.k1;
+  };
+  function cloudCanResume() {
+    return cloudLoaded() && audioEl.currentTime > 0 && !audioEl.ended && st.chunk.k0 + boundsIndex(st.chunk.bounds, audioEl.currentTime) === st.idx;
+  }
+
+  function waitForEvent(name, ms) {
+    return new Promise((resolve) => {
+      const done = () => { clearTimeout(t); audioEl.removeEventListener(name, done); audioEl.removeEventListener('error', done); resolve(); };
+      const t = setTimeout(done, ms);
+      audioEl.addEventListener(name, done);
+      audioEl.addEventListener('error', done);
+    });
+  }
+
   async function cloudSpeakFrom(i) {
     clearTimers();
     const gen = ++st.gen;
@@ -1416,21 +1698,44 @@
     savePosSoon();
     if (synth && (synth.speaking || synth.pending)) synth.cancel();
     const idx = st.idx;
-    let url;
-    try {
-      url = await getAudioUrl(S[idx].text);
-      if (st.unlock) await st.unlock;
-    } catch (e) {
-      if (gen === st.gen) cloudFailed(e, idx);
-      return;
+    let c = st.chunk;
+    const reuse = cloudLoaded();
+    if (!reuse) {
+      try {
+        c = await getChunk(idx);
+        if (st.unlock) await st.unlock;
+      } catch (e) {
+        if (gen === st.gen) cloudFailed(e, idx);
+        return;
+      }
+      if (gen !== st.gen || !st.playing) return;
+      st.chunk = c;
+      audioEl.src = c.url;
     }
-    if (gen !== st.gen || !st.playing) return;
-    st.audioIdx = idx;
-    audioEl.src = url;
     audioEl.defaultPlaybackRate = audioEl.playbackRate = settings.rate;
+    let playing;
+    if (reuse) {
+      audioEl.currentTime = c.bounds[idx - c.k0];
+      playing = audioEl.play();
+    } else {
+      // iPhoneは再生を始めるまで音声を読み込まないことがあるので、先に再生して長さが分かってから位置を合わせる
+      const seek = idx > c.k0;
+      if (seek) audioEl.muted = true;
+      playing = audioEl.play();
+      if (audioEl.readyState < 1) await waitForEvent('loadedmetadata', 8000);
+      if (gen !== st.gen) { audioEl.muted = false; return; }
+      if (!c.memo.bounds) c.memo.bounds = proportionalBounds(audioEl.duration || 0, c.says);
+      c.bounds = c.memo.bounds;
+      if (seek) {
+        audioEl.currentTime = c.bounds[idx - c.k0];
+        await waitForEvent('seeked', 1500);
+        audioEl.muted = false;
+      }
+    }
     try {
-      await audioEl.play();
+      await playing;
     } catch (e) {
+      audioEl.muted = false;
       if (gen !== st.gen) return;
       pause();
       toast('再生を始められませんでした。もう一度再生ボタンを押してください');
@@ -1439,13 +1744,92 @@
     if (gen !== st.gen) return;
     st.started = true;
     st.uttStart = performance.now();
-    // 先の数文を用意しておく(画面ロック中でも途切れにくくする)
-    for (let k = idx + 1; k <= idx + 3 && k < S.length; k++) getAudioUrl(S[k].text).catch(() => {});
+    scheduleBoundary();
+    // 次のまとまりの音声を用意しておく(画面ロック中でも途切れにくくする)
+    if (c.k1 + 1 < S.length) getChunk(c.k1 + 1).catch(() => {});
+  }
+
+  // 次の文の始まりの時刻にタイマーを掛けて、文の区切りを正確に扱う(timeupdateは0.25秒ごとと粗いので)
+  function scheduleBoundary() {
+    clearTimeout(st.boundaryTimer);
+    st.boundaryTimer = 0;
+    const c = st.chunk;
+    if (!st.playing || audioEl.paused || !cloudLoaded()) return;
+    const j = st.idx - c.k0;
+    if (j + 1 >= c.bounds.length - 1) return; // 最後の文は 'ended' で扱う
+    const ms = Math.max(0, (c.bounds[j + 1] - audioEl.currentTime) / (audioEl.playbackRate || 1) * 1000);
+    st.boundaryTimer = setTimeout(cloudTick, ms + 15);
+  }
+
+  function cloudTick() {
+    if (!st.playing || audioEl.paused || !cloudActive() || !cloudLoaded()) return;
+    const c = st.chunk;
+    const k = c.k0 + boundsIndex(c.bounds, audioEl.currentTime);
+    if (k > st.idx) onCloudBoundary(st.idx, st.idx + 1);
+    else if (k < st.idx) { st.idx = k; markCurrent(); scheduleBoundary(); }
+    else scheduleBoundary();
+  }
+
+  // 再生位置を手で動かしたあと、いまの文を合わせる
+  function cloudSyncIdx() {
+    const c = st.chunk;
+    const k = c.k0 + boundsIndex(c.bounds, audioEl.currentTime);
+    if (k !== st.idx) { st.idx = k; markCurrent(); savePosSoon(); }
+    scheduleBoundary();
+  }
+
+  // from番目の文を読み終えて、to番目に進むところ。リピート・ページのループ・文間の無音・スリープをここで扱う
+  function onCloudBoundary(from, to) {
+    const S = doc.sentences;
+    if (st.sleepPending) {
+      st.idx = Math.min(to, S.length - 1);
+      markCurrent();
+      finishSleep();
+      return;
+    }
+    let target = to;
+    let wait = settings.gap * 1000;
+    if (settings.repeat === 'sentence') {
+      target = from;
+      wait = Math.max(wait, 400);
+    } else if (settings.repeat === 'page' && (to >= S.length || S[to].page !== S[from].page)) {
+      target = firstOfPage(from);
+      wait = Math.max(wait, 800);
+    } else if (to >= S.length) {
+      pause();
+      st.offset = 0;
+      toast('最後まで読み終わりました');
+      return;
+    }
+    const c = st.chunk;
+    if (!wait && target === to && c && to <= c.k1 && !audioEl.paused) {
+      // 同じ音声の中で、そのまま次の文へ
+      st.idx = to;
+      st.offset = 0;
+      st.uttStart = performance.now();
+      markCurrent();
+      savePosSoon();
+      scheduleBoundary();
+      return;
+    }
+    audioEl.pause();
+    if (wait) {
+      st.idx = target;
+      markCurrent();
+      const gen = st.gen;
+      st.gapTimer = setTimeout(() => { if (st.playing && gen === st.gen) cloudSpeakFrom(target); }, wait);
+    } else {
+      cloudSpeakFrom(target);
+    }
   }
 
   audioEl.addEventListener('ended', () => {
-    if (st.playing && st.audioIdx === st.idx && cloudActive()) onSentenceEnd(st.gen);
+    const c = st.chunk;
+    if (!st.playing || !cloudActive() || !c || audioEl.src !== c.url) return;
+    st.idx = Math.max(st.idx, c.k1);
+    onCloudBoundary(c.k1, c.k1 + 1);
   });
+  audioEl.addEventListener('timeupdate', cloudTick); // 画面ロック中などタイマーが遅れるときの予備
   audioEl.addEventListener('play', () => { audioEl.playbackRate = settings.rate; });
 
   function cloudErrorMessage(e) {
@@ -1511,7 +1895,7 @@
       const url = await getAudioUrl('Hello! I will read your PDF aloud in this voice.');
       if (st.unlock) await st.unlock;
       if (st.playing) return;
-      st.audioIdx = -1;
+      st.chunk = null;
       audioEl.src = url;
       audioEl.playbackRate = settings.rate;
       await audioEl.play();
@@ -1558,7 +1942,7 @@
     if (wasPlaying) pause();
     settings.engine = engine;
     st.cloudError = false;
-    st.audioIdx = -1;
+    st.chunk = null;
     saveSettings();
     applyEngine();
     if (engine === 'cloud' && cloudKey && !cloudVoices) loadCloudVoices();
@@ -1842,8 +2226,13 @@
     $('#pitchValue').textContent = (+settings.pitch).toFixed(2);
     setRangeFill($('#pitchRange'));
   }
+  const REPEAT_LABEL = { sentence: '1文', page: 'ページ' };
   function applyRepeat() {
-    $('#repeatChip').setAttribute('aria-pressed', String(!!settings.repeat));
+    const chip = $('#repeatChip');
+    chip.setAttribute('aria-pressed', String(!!settings.repeat));
+    chip.dataset.mode = settings.repeat || 'off';
+    chip.setAttribute('aria-label', `リピート: ${settings.repeat ? REPEAT_LABEL[settings.repeat] : 'オフ'}`);
+    $('#repeatLabel').textContent = settings.repeat ? REPEAT_LABEL[settings.repeat] : '';
   }
   function applySwitches() {
     $('#optWord').checked = settings.wordHL;
@@ -1986,12 +2375,15 @@
     $('#speedChip').addEventListener('click', () => openSheet('speedSheet'));
     $('#voiceChip').addEventListener('click', () => { renderVoiceList(); applyEngine(); openSheet('voiceSheet'); });
     $('#menuBtn').addEventListener('click', () => { openSheet('menuSheet'); updateSleepUI(); });
+    // オフ → 1文 → ページ → オフ の順に切り替える
     $('#repeatChip').addEventListener('click', () => {
-      settings.repeat = !settings.repeat;
+      settings.repeat = !settings.repeat ? 'sentence' : settings.repeat === 'sentence' ? 'page' : false;
       saveSettings();
       applyRepeat();
-      restartSoon(); // 段落をまとめて読んでいる途中でも、いまの文からリピートに切り替える
-      toast(settings.repeat ? '同じ文をくり返します' : 'リピートを解除しました');
+      restartSoon(); // 段落をまとめて読んでいる途中でも、いまの文から切り替える
+      const s = doc && doc.sentences[st.idx];
+      toast(settings.repeat === 'sentence' ? '同じ文をくり返します'
+        : settings.repeat === 'page' ? `このページ${s ? `(p.${s.page + 1})` : ''}をくり返します` : 'リピートを解除しました');
     });
 
     $('#backdrop').addEventListener('click', closeSheets);
