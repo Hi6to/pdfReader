@@ -12,8 +12,11 @@
 
   // 速度1.0のときに1秒間に読まれるおおよその文字数(10秒スキップと残り時間の目安に使う)
   const CPS = 14.5;
-  // 1回の発話の最大文字数。長すぎるとChromeで途中で止まることがある
-  const MAX_CHUNK = 230;
+  // 1文の最大文字数。ChromeのGoogle音声(ネットワーク音声)は約15秒で止まるので短めに分ける
+  const MAX_CHUNK_NETWORK = 230;
+  const MAX_CHUNK_LOCAL = 1000;
+  // 段落をまとめて1回で読むときの最大文字数
+  const MAX_UTTERANCE = 1500;
 
   const synth = window.speechSynthesis || null;
 
@@ -34,11 +37,14 @@
   };
 
   const DEFAULTS = {
-    rate: 1, pitch: 1.05, voiceURI: '', gap: 0, repeat: false,
+    v: 2, rate: 1, pitch: 1, voiceURI: '', gap: 0, repeat: false,
     fontSize: 19, font: 'serif', theme: 'auto', wordHL: true, translate: false,
     skipHeaders: true, skipCites: true, wakeLock: true, view: 'text',
   };
-  const settings = Object.assign({}, DEFAULTS, store.get('settings', {}));
+  const storedSettings = store.get('settings', {});
+  // v1の初期値だった声の高さ1.05は、声が不自然になるので1.0に戻す
+  if (!storedSettings.v && storedSettings.pitch === 1.05) storedSettings.pitch = 1;
+  const settings = Object.assign({}, DEFAULTS, storedSettings, { v: DEFAULTS.v });
   const saveSettings = () => store.set('settings', settings);
 
   // 開いたPDFの本体はIndexedDBに置く(metaは一覧用、blobsは中身)
@@ -105,6 +111,7 @@
   const st = {
     idx: 0, offset: 0, wordPos: 0,
     playing: false, gen: 0, started: false, uttStart: 0, retries: 0, errors: 0,
+    boundaryOK: null, // 今の声が単語位置を通知するか(null=まだ分からない)
     utter: null, gapTimer: 0, speakTimer: 0, watchdog: 0,
     userScrollAt: 0, seeking: false, seekAt: 0,
     pdfPage: 1, pdfFollow: true, zoom: 1, pdfScale: 1, renderTok: 0, renderTask: null,
@@ -287,7 +294,7 @@
       if (pe < 0) pe = T.length;
       const before = sentences.length;
       for (const [a, b] of splitSentences(T, ps, pe)) {
-        for (const [c, d] of chunkLong(T, a, b)) {
+        for (const [c, d] of chunkLong(T, a, b, opt.maxChunk)) {
           const text = cleanText(T.slice(c, d), opt);
           if (!/[A-Za-z0-9]/.test(text)) continue;
           sentences.push({ a: c, b: d, text, page: pageAt(items, c), para: paraStarts.length });
@@ -300,8 +307,10 @@
     const prefix = new Float64Array(sentences.length + 1);
     sentences.forEach((s, i) => { prefix[i + 1] = prefix[i] + s.text.length; });
 
-    return { T, items, pageItems, sentences, paraStarts, prefix };
+    return { T, items, pageItems, sentences, paraStarts, prefix, maxChunk: opt.maxChunk };
   }
+
+  const buildOpts = () => Object.assign({}, settings, { maxChunk: chunkLimit() });
 
   function trimRange(T, a, b) {
     while (a < b && /\s/.test(T[a])) a++;
@@ -335,11 +344,11 @@
   }
 
   // 長い文を読点やセミコロンの位置で分ける
-  function chunkLong(T, a, b) {
+  function chunkLong(T, a, b, max) {
     const out = [];
-    while (b - a > MAX_CHUNK) {
+    while (b - a > max) {
       const len = b - a;
-      const target = len > MAX_CHUNK * 1.8 ? MAX_CHUNK : Math.ceil(len / 2) + 30;
+      const target = len > max * 1.8 ? max : Math.ceil(len / 2) + 30;
       const piece = T.slice(a, a + target);
       let cut = -1;
       const re = /[,;:)—–](?=\s)|\s[—–-](?=\s)/g;
@@ -423,7 +432,7 @@
     if (doc && doc.pdf) doc.pdf.destroy();
     const id = (pdf.fingerprints && pdf.fingerprints[0]) || `${name}-${size}`;
     doc = { id, name, size, pdf, numPages: pdf.numPages, pages };
-    Object.assign(doc, buildDoc(pages, settings));
+    Object.assign(doc, buildDoc(pages, buildOpts()));
 
     const saved = store.get('pos:' + id, null);
     st.idx = saved ? restoreIndex(saved) : 0;
@@ -471,7 +480,7 @@
     const snapshot = cur ? { i: st.idx, n: doc.sentences.length, snip: cur.text.slice(0, 50) } : null;
     const wasPlaying = st.playing;
     if (wasPlaying) pause();
-    Object.assign(doc, buildDoc(doc.pages, settings));
+    Object.assign(doc, buildDoc(doc.pages, buildOpts()));
     st.idx = snapshot ? restoreIndex(snapshot) : 0;
     st.offset = st.wordPos = 0;
     renderText();
@@ -844,14 +853,30 @@
     let en = all.filter((v) => /^en([-_]|$)/i.test(v.lang) && !NOVELTY.test(v.name));
     if (!en.length) en = all.filter((v) => /^en/i.test(v.lang));
     en.sort((a, b) => voiceScore(b) - voiceScore(a) || a.name.localeCompare(b.name));
+    const uriOf = (v) => (v ? v.voiceURI : '');
+    const before = uriOf(currentVoice());
     voices = en;
-    updateVoiceLabel();
+    if (uriOf(currentVoice()) !== before) onVoiceChanged();
+    else updateVoiceLabel();
     if (!$('#voiceSheet').hidden) renderVoiceList();
   }
 
   function currentVoice() {
     if (!voices.length) return null;
     return voices.find((v) => v.voiceURI === settings.voiceURI) || voices[0];
+  }
+
+  // ネットワーク音声(ChromeのGoogle音声など)だけ長い文を短く分ける
+  function chunkLimit() {
+    const v = currentVoice();
+    return v && v.localService === false ? MAX_CHUNK_NETWORK : MAX_CHUNK_LOCAL;
+  }
+
+  // 声が変わったら、単語位置の通知に対応しているかを測り直し、文の分け方も合わせる
+  function onVoiceChanged() {
+    st.boundaryOK = null;
+    updateVoiceLabel();
+    if (doc && doc.maxChunk !== chunkLimit()) rebuild();
   }
   function updateVoiceLabel() {
     const v = currentVoice();
@@ -942,8 +967,19 @@
     savePosSoon();
 
     const s = S[st.idx];
-    const text = s.text.slice(offset);
+    let text = s.text.slice(offset);
     if (!text.trim()) { onSentenceEnd(gen); return; }
+
+    // 単語位置の通知(boundary)が使える声なら、同じ段落の続きの文もつなげて1回で読む。
+    // 文ごとに区切って読むと、文の間に不自然な間が入るため。どの文を読んでいるかは通知の位置から求める
+    const parts = [{ k: st.idx, at: 0, base: offset }];
+    if (st.boundaryOK === true && !settings.repeat && !settings.gap) {
+      for (let k = st.idx + 1; k < S.length && S[k].para === s.para && text.length + S[k].text.length < MAX_UTTERANCE; k++) {
+        parts.push({ k, at: text.length + 1, base: 0 });
+        text += ' ' + S[k].text;
+      }
+    }
+    let sawBoundary = false;
 
     const u = new SpeechSynthesisUtterance(text);
     const v = currentVoice();
@@ -958,12 +994,23 @@
     };
     u.onboundary = (e) => {
       if (gen !== st.gen || (e.name && e.name !== 'word')) return;
-      st.wordPos = offset + e.charIndex;
+      sawBoundary = true;
+      st.boundaryOK = true;
+      let p = parts.length - 1;
+      while (p > 0 && parts[p].at > e.charIndex) p--;
+      if (parts[p].k !== st.idx) {
+        enterSentence(parts[p].k);
+        if (gen !== st.gen) return; // スリープタイマーで止まった
+      }
+      st.wordPos = parts[p].base + (e.charIndex - parts[p].at);
       markWord(st.wordPos, e.charLength);
     };
     u.onend = () => {
       if (gen !== st.gen) return;
       st.errors = 0;
+      // 3語以上読んで一度も通知がなければ、この声は単語位置の通知に対応していない
+      if (st.boundaryOK === null && !sawBoundary && text.trim().split(/\s+/).length >= 3) st.boundaryOK = false;
+      st.idx = parts[parts.length - 1].k;
       onSentenceEnd(gen);
     };
     u.onerror = (e) => {
@@ -990,6 +1037,16 @@
       if (st.retries++ < 2) speakFrom(st.idx, st.offset);
       else { pause(); toast('音声を再生できませんでした。もう一度再生ボタンを押してください'); }
     }, 4000);
+  }
+
+  // 段落をまとめて読んでいる途中で、次の文に入ったとき
+  function enterSentence(k) {
+    st.idx = k;
+    st.offset = st.wordPos = 0;
+    st.uttStart = performance.now();
+    markCurrent();
+    savePosSoon();
+    if (st.sleepPending) finishSleep();
   }
 
   function onSentenceEnd(gen) {
@@ -1470,6 +1527,7 @@
       settings.repeat = !settings.repeat;
       saveSettings();
       applyRepeat();
+      restartSoon(); // 段落をまとめて読んでいる途中でも、いまの文からリピートに切り替える
       toast(settings.repeat ? '同じ文をくり返します' : 'リピートを解除しました');
     });
 
@@ -1495,6 +1553,7 @@
       settings.gap = +e.target.value;
       saveSettings();
       applyGap();
+      restartSoon();
     });
 
     // 声シート
@@ -1511,7 +1570,7 @@
       settings.voiceURI = b.dataset.uri;
       saveSettings();
       renderVoiceList();
-      updateVoiceLabel();
+      onVoiceChanged();
       if (st.playing) restartSoon(); else previewVoice();
     });
 
