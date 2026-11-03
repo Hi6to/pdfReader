@@ -40,7 +40,7 @@
 
   const DEFAULTS = {
     v: 2, rate: 1, pitch: 1, voiceURI: '', gap: 0, repeat: false,
-    engine: 'device', cloudVoice: 'en-US-Chirp3-HD-Aoede', cloudLimit: 900000,
+    engine: 'device', systemLang: 'en-US', cloudVoice: 'en-US-Chirp3-HD-Aoede', cloudLimit: 900000,
     fontSize: 19, font: 'serif', theme: 'auto', wordHL: true, translate: false,
     skipHeaders: true, skipCites: true, skipMath: true, wakeLock: true, view: 'text',
   };
@@ -322,6 +322,17 @@
         let prevIt = null;
         for (const it of line.items) {
           let s = it.str.replace(/\s+/g, ' ');
+          // 右上についた小さな数字。単語や句読点の右上(脚注・引用の番号「word¹」)は読まない。
+          // 数字の右上(10⁵ のような指数)は「10^5」にして、読み上げでは「10 to the power of 5」と読む
+          const sup = prevIt && /^[\d,\-–*†‡§¶]+$/.test(s.trim()) && it.h < line.h * 0.8 && line.base - it.base > it.h * 0.25;
+          if (sup && opt.skipCites && /[A-Za-z.,;:)"”’]$/.test(T)) {
+            prevIt = it;
+            continue;
+          }
+          if (sup && /\d$/.test(T) && /^\d{1,3}$/.test(s.trim())) {
+            T += '^';
+            s = s.trim();
+          }
           if (prevIt && s && !/\s$/.test(T) && !s.startsWith(' ') && it.x - (prevIt.x + prevIt.w) > it.h * 0.18) T += ' ';
           if (T === '' || /\s$/.test(T)) s = s.replace(/^ +/, '');
           prevIt = it;
@@ -357,6 +368,12 @@
       if (sentences.length > before) paraStarts.push(before);
       ps = pe + 1;
     }
+
+    // 見出し(1文だけの短い段落で、文末の句読点がないもの)。表示と、読み上げの間の取り方に使う
+    paraStarts.forEach((s0, p) => {
+      const s1 = p + 1 < paraStarts.length ? paraStarts[p + 1] : sentences.length;
+      if (s1 - s0 === 1 && sentences[s0].text.length < 90 && !/[.!?:;,]["”’)]?$/.test(sentences[s0].text)) sentences[s0].heading = true;
+    });
 
     // 読み飛ばした数式は、その直前の文のうしろに印を出す(タップでPDF表示へ)
     let si = 0;
@@ -468,8 +485,9 @@
     return /^[A-Za-z]{1,2}\d*$/.test(core) && !SHORT_WORDS.has(core.toLowerCase());
   }
 
-  // 文の中の数式(「where x ∈ R^d is」の「x ∈ R^d」など)を取り除く。「~10」(およそ10)は数式にしない
-  const isMathToken = (w) => MATH_CHAR.test(w) && !/^\(?~\d/.test(w);
+  // 文の中の数式(「where x ∈ R^d is」の「x ∈ R^d」など)を取り除く。
+  // 「~10」(およそ10)と「10^5」(数の指数)は文の一部として残す
+  const isMathToken = (w) => MATH_CHAR.test(w) && !/^\(?~\d/.test(w) && !/^\(?\d+\^\d{1,3}[),.;:]?$/.test(w);
   function stripInlineMath(t) {
     if (!MATH_CHAR.test(t)) return t;
     const toks = t.split(' ');
@@ -529,7 +547,24 @@
     [/(?<![\d.])(\d{1,4})\s?[–—]\s?(\d{1,4})(?!\d|[.,]\d)/g, '$1 to $2'],
     [/(?<![\d.\-])(\d{1,4})-(\d{1,4})(?!\d|[.,]\d|-\d)/g, '$1 to $2'],
     [/~\s?(?=\d)/g, 'about '],
+    [/(\d)\^(\d{1,3})\b/g, '$1 to the power of $2'],
+    [/\band\/or\b/gi, 'and or'],
+    [/\bw\/o\b/gi, 'without'],
+    [/\bw\/(?=\s)/gi, 'with'],
+    [/\bType (II?) (?=errors?\b)/g, (m) => `Type ${m[1].length} `],
+    // 「Chapter IV」「Part II」「World War II」のローマ数字は数字にする(「Section I describe」のIは代名詞なので除く)
+    [/\b(Chapter|Part|Book|Section|Appendix|Volume|Act|Phase|Stage|Type|Class|Level|Step|War)\s+([IVXL]{1,6})\b(?=\s*$|\s*[.,:;)]|\s+[A-Z])|\b(Chapter|Part|Book|Section|Appendix|Volume|Act|Phase|Stage|Type|Class|Level|Step|War)\s+([IVXL]{2,6})\b/g,
+      (m) => { const word = m[1] || m[3]; const n = romanToInt(m[2] || m[4]); return n ? `${word} ${n}` : m[0]; }],
   ];
+  function romanToInt(r) {
+    const v = { I: 1, V: 5, X: 10, L: 50 };
+    let n = 0;
+    for (let i = 0; i < r.length; i++) n += v[r[i]] < (v[r[i + 1]] || 0) ? -v[r[i]] : v[r[i]];
+    // 正しい書き方のローマ数字だけ(IIII や VX などは対象外)
+    const back = ['', 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX'];
+    const tens = ['', 'X', 'XX', 'XXX', 'XL', 'L'];
+    return n > 0 && n < 60 && tens[Math.floor(n / 10)] + back[n % 10] === r ? n : 0;
+  }
   // 全部大文字の見出しで、ふつうの書き方に直す短い単語(それ以外の4文字以下は略語として残す)
   const CAPS_COMMON = new Set('A AN THE AND OR OF TO IN ON AT BY FOR WITH FROM INTO ONTO OVER AS IS ARE WAS BE NOT NO ITS IT THIS THAT WE YOU OUR HOW WHY WHAT WHEN ONE TWO SIX TEN PART'.split(' '));
 
@@ -540,7 +575,8 @@
       let m;
       while ((m = re.exec(src))) {
         if (!m[0].length) { re.lastIndex++; continue; }
-        hits.push({ a: m.index, b: m.index + m[0].length, out: rep.replace(/\$(\d)/g, (_, d) => m[+d] || '') });
+        const out = typeof rep === 'function' ? rep(m) : rep.replace(/\$(\d)/g, (_, d) => m[+d] || '');
+        hits.push({ a: m.index, b: m.index + m[0].length, out });
       }
     }
     hits.sort((x, y) => x.a - y.a || y.b - x.b);
@@ -788,8 +824,7 @@
         html += `<span class="s" data-i="${i}">${esc(s.text)}</span> `;
         if (s.math != null) html += `<button type="button" class="mathmark" data-math-page="${s.math + 1}" aria-label="読み飛ばした数式をPDFで見る(${s.math + 1}ページ)">数式</button> `;
       }
-      const heading = s1 - s0 === 1 && S[s0].text.length < 90 && !/[.!?:;,]["”’)]?$/.test(S[s0].text);
-      parts.push(heading ? `<p class="h">${html}</p>` : `<p>${html}</p>`);
+      parts.push(S[s0].heading ? `<p class="h">${html}</p>` : `<p>${html}</p>`);
     }
     tv.innerHTML = `<div class="text-inner">${parts.join('')}</div>`;
     spans = $$('.s', tv);
@@ -1067,9 +1102,23 @@
     if (!$('#voiceSheet').hidden) renderVoiceList();
   }
 
+  // 「iPhoneの設定の声」: 声を指定せずに言語だけを指定すると、Safariは言語から声を選ぶ。
+  // 最近のiOSではそれが設定アプリの「読み上げコンテンツ › 声」で選んだ声になるので、
+  // 一覧には出てこない、ダウンロードした高音質の声(Premium/Enhanced)を使える可能性がある
+  const SYSTEM_VOICE = 'system';
+  const useSystemVoice = () => settings.voiceURI === SYSTEM_VOICE;
+  const SYSTEM_LANGS = ['en-US', 'en-GB', 'en-AU', 'en-IE', 'en-IN', 'en-ZA'];
+
   function currentVoice() {
-    if (!voices.length) return null;
+    if (!voices.length || useSystemVoice()) return null;
     return voices.find((v) => v.voiceURI === settings.voiceURI) || voices[0];
+  }
+
+  // 発話に声を設定する
+  function applyVoice(u) {
+    const v = currentVoice();
+    if (v) { u.voice = v; u.lang = v.lang; }
+    else u.lang = useSystemVoice() ? settings.systemLang : 'en-US';
   }
 
   // ネットワーク音声(ChromeのGoogle音声など)だけ長い文を短く分ける
@@ -1088,6 +1137,7 @@
     const cloud = cloudActive();
     $('#voiceChip').classList.toggle('cloud', cloud);
     if (cloud) { $('#voiceLabel').textContent = cloudVoiceShort(settings.cloudVoice); return; }
+    if (useSystemVoice()) { $('#voiceLabel').textContent = '設定の声'; return; }
     const v = currentVoice();
     $('#voiceLabel').textContent = v ? v.name.replace(/^(Microsoft|Google)\s+/, '').replace(/\s+Online.*$/, '') : '標準';
   }
@@ -1098,7 +1148,17 @@
       ['おすすめ(女性の声)', voices.filter((v) => isFemale(v) && !ROBOTIC.test(v.name))],
       ['そのほかの英語の声', voices.filter((v) => !isFemale(v) || ROBOTIC.test(v.name))],
     ];
-    let html = '';
+    const sys = useSystemVoice();
+    let html = `<div class="voice-group">iPhoneの設定の声</div>
+      <button type="button" class="voice" role="radio" aria-checked="${sys}" data-uri="${SYSTEM_VOICE}">
+        <span class="voice-dot"></span>
+        <span class="voice-body"><span class="voice-name">設定アプリで選んだ声</span><span class="voice-lang">${esc(langLabel(settings.systemLang))}・ダウンロードした高音質の声を使える場合があります</span></span>
+        <span class="tag good">高音質向け</span>
+      </button>`;
+    if (sys) {
+      html += `<label class="sys-lang" for="sysLang"><span>英語の種類</span>
+        <select id="sysLang">${SYSTEM_LANGS.map((c) => `<option value="${c}"${c === settings.systemLang ? ' selected' : ''}>${esc(langLabel(c))}</option>`).join('')}</select></label>`;
+    }
     for (const [label, list] of groups) {
       if (!list.length) continue;
       html += `<div class="voice-group">${label}</div>`;
@@ -1116,9 +1176,8 @@
 
   function previewVoice() {
     if (!synth || st.playing) return;
-    const v = currentVoice();
     const u = new SpeechSynthesisUtterance('Hello! I will read your PDF aloud at this speed.');
-    if (v) { u.voice = v; u.lang = v.lang; }
+    applyVoice(u);
     u.rate = settings.rate;
     u.pitch = settings.pitch;
     synth.cancel();
@@ -1133,6 +1192,16 @@
     clearTimeout(st.watchdog);
     clearTimeout(st.boundaryTimer);
     st.gapTimer = st.speakTimer = st.watchdog = st.boundaryTimer = 0;
+  }
+
+  // 段落の変わり目と見出しの前後に、ナレーターのような間を入れる(ミリ秒。速く読むときは短くする)。
+  // 声の側でも文末に短い無音が入るので、それに足す分
+  const PARA_PAUSE = 350;
+  const HEADING_PAUSE = 650;
+  function naturalPause(from, to) {
+    const S = doc.sentences;
+    if (to >= S.length || to <= from || S[to].para === S[from].para) return 0;
+    return (S[from].heading || S[to].heading ? HEADING_PAUSE : PARA_PAUSE) / settings.rate;
   }
 
   // i番目の文と同じページの最初の文(文はページ順に並んでいる)
@@ -1220,8 +1289,7 @@
     let sawBoundary = false;
 
     const u = new SpeechSynthesisUtterance(text);
-    const v = currentVoice();
-    if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = 'en-US'; }
+    applyVoice(u);
     u.rate = settings.rate;
     u.pitch = settings.pitch;
     u.onstart = () => {
@@ -1266,7 +1334,8 @@
 
     if (synth.speaking || synth.pending) {
       synth.cancel();
-      st.speakTimer = setTimeout(() => { if (gen === st.gen) startUtterance(u, gen); }, 80);
+      // Safariは中断の直後に読ませると開始・終了の通知が来ないことがあるので、少し待ってから読む
+      st.speakTimer = setTimeout(() => { if (gen === st.gen) startUtterance(u, gen); }, 150);
     } else {
       startUtterance(u, gen); // iOSでは最初の発話をタップ操作の中で同期的に始める必要がある
     }
@@ -1311,6 +1380,8 @@
         st.offset = st.wordPos = 0;
         toast('最後まで読み終わりました');
         return;
+      } else {
+        delay = Math.max(delay, naturalPause(st.idx, next));
       }
     }
     st.idx = next;
@@ -1800,6 +1871,8 @@
       st.offset = 0;
       toast('最後まで読み終わりました');
       return;
+    } else {
+      wait = Math.max(wait, naturalPause(from, to));
     }
     const c = st.chunk;
     if (!wait && target === to && c && to <= c.k1 && !audioEl.paused) {
@@ -2423,6 +2496,15 @@
       const b = e.target.closest('[data-uri]');
       if (!b) return;
       settings.voiceURI = b.dataset.uri;
+      saveSettings();
+      renderVoiceList();
+      onVoiceChanged();
+      if (st.playing) restartSoon(); else previewVoice();
+    });
+    // 「iPhoneの設定の声」の英語の種類
+    $('#voiceList').addEventListener('change', (e) => {
+      if (e.target.id !== 'sysLang') return;
+      settings.systemLang = e.target.value;
       saveSettings();
       renderVoiceList();
       onVoiceChanged();

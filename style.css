@@ -752,3 +752,8 @@ input[type="range"]::-moz-range-thumb {
 .repeat-chip[data-mode="sentence"] .i-repeat-one { display: block; }
 .repeat-chip[data-mode="sentence"] .i-repeat { display: none; }
 .repeat-chip #repeatLabel:empty { display: none; }
+
+/* 「iPhoneの設定の声」の英語の種類 */
+.sys-lang { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 12px 10px 40px; font-size: 13px; color: var(--muted); }
+.sys-lang select { font-size: 16px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); }
+#devicePanel .tips ol { padding-left: 1.3em; display: flex; flex-direction: column; gap: 6px; }
