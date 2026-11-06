@@ -43,6 +43,7 @@
     engine: 'device', systemLang: 'en-US', cloudVoice: 'en-US-Chirp3-HD-Aoede', cloudLimit: 900000,
     fontSize: 19, font: 'serif', theme: 'auto', wordHL: true, translate: false,
     skipHeaders: true, skipCites: true, skipMath: true, wakeLock: true, view: 'text',
+    transEngine: 'plamo', plamoModel: 'q4',
   };
   const storedSettings = store.get('settings', {});
   // v1の初期値だった声の高さ1.05は、声が不自然になるので1.0に戻す
@@ -110,6 +111,7 @@
         t.objectStore('meta').delete(id);
         t.objectStore('blobs').delete(id);
         t.objectStore('trans').delete(id);
+        t.objectStore('trans').delete(id + '|plamo');
       }),
       transGet: (id) => run(['trans'], 'readonly', (t, box) => {
         const r = t.objectStore('trans').get(id);
@@ -2228,6 +2230,7 @@
     const panel = $('#transPanel');
     panel.hidden = !settings.translate || !doc || !doc.sentences.length;
     if (panel.hidden) return;
+    if (settings.transEngine === 'plamo') { plamoShow(); return; }
     const i = st.idx;
     const S = doc.sentences;
     const box = $('#transText');
@@ -2260,21 +2263,294 @@
     clearTimeout(transSaveTimer);
     transSaveTimer = setTimeout(saveTrans, 2000);
   }
+  // 訳はエンジンごとに別々に保存する(Google翻訳はPDFのid、PLaMoは「id|plamo」)
   function saveTrans() {
     clearTimeout(transSaveTimer);
     if (!doc) return;
-    const map = {};
-    let n = 0;
-    for (const s of doc.sentences) {
-      if (transCache.has(s.text)) { map[s.text] = transCache.get(s.text); n++; }
+    for (const [suffix, cache] of [['', transCache], ['|plamo', plamoCache]]) {
+      const map = {};
+      let n = 0;
+      for (const s of doc.sentences) {
+        if (cache.has(s.text)) { map[s.text] = cache.get(s.text); n++; }
+      }
+      if (n) library.transPut(doc.id + suffix, map).catch(() => {});
     }
-    if (n) library.transPut(doc.id, map).catch(() => {});
   }
   async function loadTrans(id) {
+    for (const [suffix, cache] of [['', transCache], ['|plamo', plamoCache]]) {
+      try {
+        const map = await library.transGet(id + suffix);
+        if (map) for (const [en, ja] of Object.entries(map)) cache.set(en, ja);
+      } catch { /* 保存できない環境でも訳は作れる */ }
+    }
+  }
+
+  // ---------------------------------------------------------------- PLaMo(端末内の翻訳)
+  // PFNの翻訳特化モデル PLaMo 3 Translate 0.8B を、wllama(llama.cppのWebAssembly版)でブラウザ内で動かす。
+  // モデルはHugging Faceから一度だけダウンロードしてブラウザ専用の保存領域(OPFS)に置き、以後は通信なしで訳す
+  const PLAMO_BASE = 'https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/';
+  const PLAMO_MODELS = {
+    q4: { file: 'plamo-3-translate-0.8b-Q4_0.gguf', mb: 522 },
+    q3: { file: 'plamo-3-translate-0.8b-Q3_K_M.gguf', mb: 464 },
+  };
+  const PLAMO_AHEAD = 6; // いまの文の先を何文まで訳しておくか
+  const plamoCache = new Map(); // 英文 → 訳文
+  const plamo = { state: 'idle', mod: null, cm: null, wllama: null, progress: 0, error: '', queue: [], busy: false, abort: null, threads: 0, downloaded: null };
+  const plamoUrl = () => PLAMO_BASE + PLAMO_MODELS[settings.plamoModel].file;
+
+  async function plamoModule() {
+    if (!plamo.mod) plamo.mod = await import('./vendor/wllama-3.8.1/index.js');
+    return plamo.mod;
+  }
+  async function plamoCacheManager() {
+    if (!plamo.cm) plamo.cm = new (await plamoModule()).CacheManager();
+    return plamo.cm;
+  }
+
+  // モデルが最後までダウンロード済みか(途中で止まったファイルは使わない)
+  async function plamoDownloaded() {
+    const cm = await plamoCacheManager();
+    const name = await cm.getNameFromURL(plamoUrl());
+    const size = await cm.getSize(name);
+    const meta = await cm.getMetadata(name);
+    return size > 0 && !!meta && (!meta.originalSize || size === meta.originalSize);
+  }
+
+  // GGUFの tokenizer.ggml.model の値 "plamo3" を "plamo2" に書き換える。
+  // 同梱のwllama 3.8.1のllama.cppはPLaMo 3の区切り方の名前を知らないが、中身はPLaMo 2の区切り方に
+  // 「同じ文字が4つ以上続く所と空白2つ以上の所でも区切る」処理を足しただけなので、名前を合わせれば読める
+  function patchPlamoTokenizer(head) {
+    const key = new TextEncoder().encode('tokenizer.ggml.model');
+    outer: for (let i = 0; i < head.length - key.length - 18; i++) {
+      for (let k = 0; k < key.length; k++) if (head[i + k] !== key[k]) continue outer;
+      const v = i + key.length + 4 + 8; // 値の型(uint32)と文字列の長さ(uint64)のうしろ
+      if (new TextDecoder().decode(head.subarray(v, v + 6)) === 'plamo3') head[v + 5] = 0x32; // '2'
+      return;
+    }
+  }
+
+  async function plamoInit() {
+    if (plamo.state !== 'idle') return;
+    plamo.state = 'checking';
+    refreshPlamo();
     try {
-      const map = await library.transGet(id);
-      if (map) for (const [en, ja] of Object.entries(map)) transCache.set(en, ja);
-    } catch { /* 保存できない環境でも訳は取れる */ }
+      plamo.downloaded = await plamoDownloaded();
+      if (plamo.downloaded) await plamoLoad();
+      else { plamo.state = 'none'; refreshPlamo(); }
+    } catch (e) { plamoFail(e); }
+  }
+
+  async function plamoDownload() {
+    if (plamo.state === 'downloading' || plamo.state === 'loading') return;
+    plamo.state = 'downloading';
+    plamo.progress = 0;
+    refreshPlamo();
+    try {
+      const cm = await plamoCacheManager();
+      if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+      plamo.abort = new AbortController();
+      let shown = -1;
+      await cm.download(plamoUrl(), {
+        signal: plamo.abort.signal,
+        progressCallback: ({ loaded, total }) => {
+          plamo.progress = total ? loaded / total : 0;
+          const pct = Math.floor(plamo.progress * 100);
+          if (pct !== shown) { shown = pct; refreshPlamo(); }
+        },
+      });
+      plamo.abort = null;
+      await plamoLoad();
+    } catch (e) {
+      plamo.abort = null;
+      if (e && e.name === 'AbortError') { plamo.state = 'none'; refreshPlamo(); return; }
+      plamoFail(e);
+    }
+  }
+
+  async function plamoLoad() {
+    plamo.state = 'loading';
+    refreshPlamo();
+    const { Wllama } = await plamoModule();
+    const cm = await plamoCacheManager();
+    const blob = await cm.open(plamoUrl());
+    if (!blob) { plamo.state = 'none'; refreshPlamo(); return; }
+    const headLen = Math.min(blob.size, 4 * 1048576);
+    const head = new Uint8Array(await blob.slice(0, headLen).arrayBuffer());
+    patchPlamoTokenizer(head);
+    const model = new Blob([head, blob.slice(headLen)]);
+    const quiet = { debug: () => {}, log: () => {}, warn: () => {}, error: (...a) => console.warn('wllama', ...a) };
+    const make = () => new Wllama({ default: 'vendor/wllama-3.8.1/wllama.wasm' }, { logger: quiet, allowOffline: true });
+    // マルチスレッドが使えるなら最大4スレッドで。読み込みに失敗したら1スレッドでやり直す
+    const threads = window.crossOriginIsolated ? Math.max(1, Math.min(4, navigator.hardwareConcurrency || 2)) : 1;
+    let w = make();
+    try {
+      await w.loadModel([model], { n_ctx: 1024, n_threads: threads, n_gpu_layers: 0 });
+    } catch (e) {
+      await w.exit().catch(() => {});
+      if (threads === 1) throw e;
+      w = make();
+      await w.loadModel([model], { n_ctx: 1024, n_threads: 1, n_gpu_layers: 0 });
+    }
+    plamo.wllama = w;
+    plamo.threads = w.getNumThreads();
+    plamo.downloaded = true;
+    plamo.state = 'ready';
+    refreshPlamo();
+    if (settings.translate && settings.transEngine === 'plamo') showTranslation();
+  }
+
+  function plamoFail(e) {
+    console.warn('PLaMo', e);
+    plamo.state = 'error';
+    plamo.error = String((e && e.message) || e || '');
+    refreshPlamo();
+  }
+
+  async function plamoUnload() {
+    plamo.queue = [];
+    if (plamo.wllama) { const w = plamo.wllama; plamo.wllama = null; await w.exit().catch(() => {}); }
+    if (plamo.state === 'ready' || plamo.state === 'error') plamo.state = 'idle';
+  }
+
+  async function plamoDelete() {
+    if (plamo.abort) plamo.abort.abort();
+    await plamoUnload();
+    try {
+      const cm = await plamoCacheManager();
+      for (const m of Object.values(PLAMO_MODELS)) await cm.delete(PLAMO_BASE + m.file).catch(() => {});
+    } catch { /* noop */ }
+    plamo.downloaded = false;
+    plamo.state = 'none';
+    refreshPlamo();
+    toast('翻訳モデルを削除しました');
+  }
+
+  async function plamoTranslate(text) {
+    // 本文に特別な記号に見える文字列があっても、記号として扱われないようにしておく
+    const src = text.replace(/<\|/g, '<​|');
+    const prompt = `<|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:msg|>${src}<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>`;
+    const r = await plamo.wllama.createCompletion({
+      prompt,
+      max_tokens: Math.min(512, 32 + text.length * 2),
+      temperature: 0,
+      stop: ['<|plamo:tag|>', '<|plamo:bos|>'],
+    });
+    return r.choices[0].text.trim();
+  }
+
+  // いまの文から先の未翻訳の文を、いまの文を先頭にして順番待ちに入れる
+  function plamoQueueFrom(i) {
+    if (!doc) return;
+    const S = doc.sentences;
+    const want = [];
+    for (let k = i; k < S.length && want.length < PLAMO_AHEAD; k++) {
+      const t = S[k].text;
+      if (!plamoCache.has(t) && !want.includes(t)) want.push(t);
+    }
+    plamo.queue = want;
+    plamoPump();
+  }
+
+  async function plamoPump() {
+    if (plamo.busy || plamo.state !== 'ready' || !settings.translate || settings.transEngine !== 'plamo') return;
+    const t = plamo.queue.shift();
+    if (t == null) return;
+    if (plamoCache.has(t)) { plamoPump(); return; }
+    plamo.busy = true;
+    plamo.current = t;
+    try {
+      plamoCache.set(t, await plamoTranslate(t));
+      saveTransSoon();
+      if (doc && doc.sentences[st.idx] && doc.sentences[st.idx].text === t) showTranslation();
+    } catch (e) {
+      console.warn('PLaMo translate', e);
+      if (!plamo.wllama || !plamo.wllama.isModelLoaded()) { plamoFail(e); return; }
+    } finally {
+      plamo.busy = false;
+      plamo.current = null;
+    }
+    plamoPump();
+  }
+
+  function plamoShow() {
+    const i = st.idx;
+    const S = doc.sentences;
+    const box = $('#transText');
+    const t = S[i].text;
+    if (plamoCache.has(t)) {
+      box.textContent = plamoCache.get(t);
+      box.classList.remove('muted');
+      if (plamo.state === 'ready') plamoQueueFrom(i + 1);
+      else if (plamo.state === 'idle') plamoInit();
+      return;
+    }
+    box.classList.add('muted');
+    const mb = PLAMO_MODELS[settings.plamoModel].mb;
+    switch (plamo.state) {
+      case 'idle':
+        plamoInit();
+        box.textContent = '翻訳モデルを確認しています…';
+        break;
+      case 'checking':
+        box.textContent = '翻訳モデルを確認しています…';
+        break;
+      case 'none':
+        box.innerHTML = `端末の中で翻訳するには、最初に翻訳モデル「PLaMo 3 Translate」(約${mb}MB)をダウンロードしてください。Wi-Fiでのダウンロードがおすすめです。
+          <button type="button" class="link-btn" data-plamo-download>ダウンロード</button>
+          <button type="button" class="link-btn" data-plamo-google>Google翻訳を使う</button>`;
+        break;
+      case 'downloading':
+        box.innerHTML = `翻訳モデルをダウンロードしています… ${Math.floor(plamo.progress * 100)}%(約${mb}MB) <button type="button" class="link-btn" data-plamo-cancel>中止</button>`;
+        break;
+      case 'loading':
+        box.textContent = '翻訳モデルを読み込んでいます…';
+        break;
+      case 'error':
+        box.innerHTML = `翻訳モデルを使えませんでした(${esc(plamo.error.slice(0, 120))})。空き容量やメモリが足りない場合は「軽量」のモデルを試してください。
+          <button type="button" class="link-btn" data-plamo-retry>もう一度</button>
+          <button type="button" class="link-btn" data-plamo-google>Google翻訳を使う</button>`;
+        break;
+      default: // ready
+        // 別の文を訳している途中なら、それが終わってから(1文ずつしか訳せないため)
+        box.textContent = plamo.busy && plamo.current !== t ? '訳しています…(先に始めた文を訳し終えたら表示します)' : '訳しています…';
+        plamoQueueFrom(i);
+    }
+  }
+
+  // 設定画面と訳の欄の表示を、いまの状態に合わせる
+  function refreshPlamo() {
+    const status = $('#plamoStatus');
+    if (status) {
+      const mb = PLAMO_MODELS[settings.plamoModel].mb;
+      status.textContent = {
+        idle: plamo.downloaded ? 'ダウンロード済みです。訳を表示すると読み込みます。' : '',
+        checking: '確認しています…', none: `まだダウンロードしていません(約${mb}MB)。`,
+        downloading: `ダウンロード中… ${Math.floor(plamo.progress * 100)}%`, loading: '読み込んでいます…',
+        ready: `使えます(${plamo.threads > 1 ? `マルチスレッド ${plamo.threads}` : '1スレッド'})`,
+        error: `エラー: ${plamo.error.slice(0, 100)}`,
+      }[plamo.state] || '';
+      $('#plamoDownloadBtn').hidden = !(plamo.state === 'none' || plamo.state === 'error' || (plamo.state === 'idle' && !plamo.downloaded));
+      $('#plamoDeleteBtn').hidden = !(plamo.state === 'ready' || plamo.state === 'error' || (plamo.state === 'idle' && plamo.downloaded));
+    }
+    if (settings.translate && settings.transEngine === 'plamo' && doc && !$('#transPanel').hidden) plamoShow();
+  }
+
+  function applyTransEngine() {
+    $$('#transEngineSeg button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.engineTrans === settings.transEngine)));
+    $$('#plamoModelSeg button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.plamoModel === settings.plamoModel)));
+    $('#plamoPrefs').hidden = settings.transEngine !== 'plamo';
+    $('#transEngineLabel').textContent = settings.transEngine === 'plamo' ? 'Built with PLaMo' : 'Google翻訳';
+    refreshPlamo();
+  }
+
+  function setTransEngine(engine) {
+    if (settings.transEngine === engine) return;
+    settings.transEngine = engine;
+    saveSettings();
+    if (engine !== 'plamo') plamoUnload().then(refreshPlamo); // メモリを空ける
+    applyTransEngine();
+    showTranslation();
+    if (settings.translate) toast(engine === 'plamo' ? '訳を端末内のPLaMoで作ります(通信なし)' : '訳をGoogle翻訳で作ります');
   }
 
   function applyTranslate() {
@@ -2286,9 +2562,11 @@
     settings.translate = !settings.translate;
     saveSettings();
     applyTranslate();
-    if (settings.translate && !store.get('transNoticed', false)) {
-      store.set('transNoticed', true);
-      toast('訳はGoogle翻訳で作ります。読んでいるページの文だけが送信され、訳は端末に保存されます');
+    if (settings.translate && !store.get('transNoticed2', false)) {
+      store.set('transNoticed2', true);
+      toast(settings.transEngine === 'plamo'
+        ? '訳は端末内のPLaMoで作ります。文はどこにも送られません'
+        : '訳はGoogle翻訳で作ります。読んでいるページの文だけが送信され、訳は端末に保存されます');
     }
   }
 
@@ -2465,7 +2743,39 @@
     window.addEventListener('popstate', () => { if (doc) closeDoc(); });
 
     $('#transBtn').addEventListener('click', toggleTranslate);
-    $('#transPanel').addEventListener('click', (e) => { if (e.target.closest('[data-retry]')) showTranslation(true); });
+    $('#transPanel').addEventListener('click', (e) => {
+      if (e.target.closest('[data-retry]')) showTranslation(true);
+      else if (e.target.closest('[data-plamo-download]')) plamoDownload();
+      else if (e.target.closest('[data-plamo-cancel]')) { if (plamo.abort) plamo.abort.abort(); }
+      else if (e.target.closest('[data-plamo-retry]')) { plamoUnload().then(() => { plamo.state = 'idle'; plamoInit(); }); }
+      else if (e.target.closest('[data-plamo-google]')) setTransEngine('google');
+      else if (e.target.closest('#transEngineLabel')) setTransEngine(settings.transEngine === 'plamo' ? 'google' : 'plamo');
+    });
+    $('#transEngineSeg').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-engine-trans]');
+      if (b) setTransEngine(b.dataset.engineTrans);
+    });
+    $('#plamoModelSeg').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-plamo-model]');
+      if (!b || b.dataset.plamoModel === settings.plamoModel) return;
+      settings.plamoModel = b.dataset.plamoModel;
+      saveSettings();
+      plamoUnload().then(() => { plamo.state = 'idle'; applyTransEngine(); if (settings.translate) showTranslation(); else plamoInit(); });
+    });
+    $('#plamoDownloadBtn').addEventListener('click', plamoDownload);
+    // 削除は2回押しで(誤って消さないように)
+    $('#plamoDeleteBtn').addEventListener('click', (e) => {
+      const b = e.currentTarget;
+      if (!b.dataset.confirm) {
+        b.dataset.confirm = '1';
+        b.textContent = 'もう一度押すと削除';
+        setTimeout(() => { delete b.dataset.confirm; b.textContent = 'モデルを削除'; }, 3000);
+        return;
+      }
+      delete b.dataset.confirm;
+      b.textContent = 'モデルを削除';
+      plamoDelete();
+    });
     $('#modeText').addEventListener('click', () => { settings.view = 'text'; saveSettings(); applyView(); });
     $('#modePdf').addEventListener('click', () => { settings.view = 'pdf'; saveSettings(); applyView(); });
 
@@ -2554,7 +2864,14 @@
 
     $('#speedChip').addEventListener('click', () => openSheet('speedSheet'));
     $('#voiceChip').addEventListener('click', () => { renderVoiceList(); applyEngine(); openSheet('voiceSheet'); });
-    $('#menuBtn').addEventListener('click', () => { openSheet('menuSheet'); updateSleepUI(); });
+    $('#menuBtn').addEventListener('click', () => {
+      openSheet('menuSheet');
+      updateSleepUI();
+      // 設定画面を開いたら、翻訳モデルがダウンロード済みかを確かめて表示する
+      if (settings.transEngine === 'plamo' && plamo.state === 'idle') {
+        plamoDownloaded().then((ok) => { plamo.downloaded = ok; if (plamo.state === 'idle') { if (!ok) plamo.state = 'none'; refreshPlamo(); } }).catch(() => {});
+      }
+    });
     // オフ → 1文 → ページ → オフ の順に切り替える
     $('#repeatChip').addEventListener('click', () => {
       settings.repeat = !settings.repeat ? 'sentence' : settings.repeat === 'sentence' ? 'page' : false;
@@ -2767,6 +3084,7 @@
     applyPitch();
     applyRepeat();
     applySwitches();
+    applyTransEngine();
     applyTranslate();
     applyEngine();
     updateSleepUI();

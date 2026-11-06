@@ -18,6 +18,18 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&display=swap">
 <link rel="stylesheet" href="style.css">
+<script>
+  // 端末内の翻訳(PLaMo)をマルチスレッドで動かすため、COOP/COEPを付けるService Workerを使う。
+  // 初めて入れたときだけ、効かせるために1回だけ読み込み直す
+  if ('serviceWorker' in navigator && window.isSecureContext && !window.crossOriginIsolated) {
+    navigator.serviceWorker.register('sw.js').then(function (reg) {
+      if (navigator.serviceWorker.controller) return; // 入っているのに分離されない(未対応のブラウザ)ときは何もしない
+      try { if (sessionStorage.getItem('pdfr:coiReload')) return; sessionStorage.setItem('pdfr:coiReload', '1'); } catch (e) { return; }
+      var reload = function () { location.reload(); };
+      if (reg.active) reload(); else navigator.serviceWorker.addEventListener('controllerchange', reload, { once: true });
+    }).catch(function () {});
+  }
+</script>
 <script src="vendor/pdfjs-3.11.174/pdf.min.js"></script>
 <script src="app.js" defer></script>
 </head>
@@ -114,7 +126,7 @@
 
   <div id="transPanel" class="trans-panel" hidden>
     <div class="trans-inner">
-      <div class="trans-head"><span>日本語訳</span><span>Google翻訳</span></div>
+      <div class="trans-head"><span>日本語訳</span><button type="button" id="transEngineLabel" class="trans-engine" aria-label="翻訳エンジンを切り替える">Built with PLaMo</button></div>
       <p id="transText" class="trans-text" lang="ja"></p>
     </div>
   </div>
@@ -341,6 +353,30 @@
     <label class="row" for="optCites"><span>引用番号 [12] やURLを読まない</span><input type="checkbox" class="switch" id="optCites"></label>
     <label class="row" for="optMath"><span>数式を読まない</span><input type="checkbox" class="switch" id="optMath"></label>
     <label class="row" for="optWake"><span>読み上げ中は画面を消さない</span><input type="checkbox" class="switch" id="optWake"></label>
+
+    <h4 class="group-label">日本語訳</h4>
+    <div class="row">
+      <span>翻訳エンジン</span>
+      <span class="seg small" id="transEngineSeg">
+        <button type="button" data-engine-trans="plamo" aria-pressed="true">PLaMo(端末内)</button>
+        <button type="button" data-engine-trans="google" aria-pressed="false">Google</button>
+      </span>
+    </div>
+    <div id="plamoPrefs">
+      <div class="row">
+        <span>モデルの大きさ</span>
+        <span class="seg small" id="plamoModelSeg">
+          <button type="button" data-plamo-model="q4" aria-pressed="true">標準 522MB</button>
+          <button type="button" data-plamo-model="q3" aria-pressed="false">軽量 464MB</button>
+        </span>
+      </div>
+      <p id="plamoStatus" class="note"></p>
+      <div class="plamo-actions">
+        <button type="button" id="plamoDownloadBtn" class="chip sm">モデルをダウンロード</button>
+        <button type="button" id="plamoDeleteBtn" class="chip sm">モデルを削除</button>
+      </div>
+      <p class="note">PFNの翻訳特化モデル「PLaMo 3 Translate 0.8B」を、このiPhoneの中で動かします。最初に一度だけモデルをダウンロードすれば(Wi-Fi推奨)、そのあとは通信なしで訳せます。訳す文はどこにも送られません。Built with PLaMo(<a href="https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF" target="_blank" rel="noopener">PLaMoコミュニティライセンス</a>)</p>
+    </div>
 
     <h4 class="group-label">操作のヒント</h4>
     <ul class="help">
